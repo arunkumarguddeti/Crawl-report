@@ -438,17 +438,17 @@ def write_csv(results: list[dict], path: str):
 
 # ──────────────────────────────────────────────
 #  HTML REPORT GENERATION
+#  Architecture: all data stored as a JS JSON array.
+#  Only PAGE_SIZE rows are rendered into the DOM at once.
+#  Filtering/sorting runs entirely on the JS array — never
+#  touches 5000+ DOM nodes — so filtering is instant and
+#  the browser never freezes regardless of dataset size.
 # ──────────────────────────────────────────────
 
 def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str:
-    """
-    Returns a complete self-contained HTML string with:
-    - Summary dashboard cards
-    - Doughnut + bar charts (Chart.js CDN)
-    - Filterable, searchable, sortable results table
-    - Effort level badges
-    - CSV export button
-    """
+
+    PAGE_SIZE     = 100   # rows rendered in DOM at one time
+
     total_links   = len(results)
     pages_set     = {r["page_url"] for r in results}
     total_pages   = len(pages_set)
@@ -460,16 +460,17 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
     external      = sum(1 for r in results if r.get("link_type") == "External")
     internal      = sum(1 for r in results if r.get("link_type") == "Internal")
 
-    # Category counts for chart
+    # Category counts for doughnut chart
     cat_counts: dict[str, int] = {}
     for r in results:
         cat = r.get("category", "Unknown")
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
-    # Top pages with most broken links
+    # Top parent pages with most broken/error links for bar chart
     broken_by_page: dict[str, int] = {}
     for r in results:
-        if str(r["status"]) in ("404","410","451") or "Error" in str(r["status"]) or "Timeout" in str(r["status"]):
+        s = str(r["status"])
+        if s in ("404","410","451") or "Error" in s or "Timeout" in s:
             broken_by_page[r["page_url"]] = broken_by_page.get(r["page_url"], 0) + 1
     top_broken = sorted(broken_by_page.items(), key=lambda x: -x[1])[:10]
 
@@ -479,8 +480,7 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
         "#22c55e","#16a34a","#f59e0b","#ef4444","#dc2626",
         "#3b82f6","#8b5cf6","#64748b","#0ea5e9","#f97316"
     ][:len(cat_counts)])
-
-    bar_labels = json.dumps([p[:50] + "..." if len(p) > 50 else p for p, _ in top_broken])
+    bar_labels = json.dumps([p[:60] + "…" if len(p) > 60 else p for p, _ in top_broken])
     bar_values = json.dumps([v for _, v in top_broken])
 
     run_time = f"{elapsed:.1f}s"
@@ -489,51 +489,31 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
 
     def row_class(status):
         s = str(status)
-        if s == "200":            return "ok"
-        if s.startswith("3"):     return "redirect"
-        if s in ("404","410"):    return "broken"
-        if s.startswith("4"):     return "warn"
-        if s.startswith("5"):     return "servererr"
+        if s == "200":         return "ok"
+        if s.startswith("3"):  return "redirect"
+        if s in ("404","410"): return "broken"
+        if s.startswith("4"):  return "warn"
+        if s.startswith("5"):  return "servererr"
         return "unkn"
 
-    def effort_badge(effort):
-        cls = {
-            "None":       "badge-none",
-            "Low":        "badge-low",
-            "Low-Medium": "badge-lowmed",
-            "Medium":     "badge-med",
-            "High":       "badge-high",
-        }.get(effort, "badge-med")
-        return f'<span class="badge {cls}">{effort}</span>'
-
-    def status_pill(status):
-        cls = row_class(status)
-        return f'<span class="status-pill pill-{cls}">{status}</span>'
-
-    table_rows = []
+    # Serialise all results as a compact JS array — this is the single
+    # source of truth; the table is rendered from this, never from DOM.
+    js_rows = []
     for r in results:
-        rc = row_class(r["status"])
-        page  = r["page_url"][:80]
-        link  = r["link_url"][:80]
-        text  = r.get("link_text","")[:60].replace("<","&lt;").replace(">","&gt;")
-        ltype = r.get("link_type","")
-        depth = r.get("depth","")
-        cat   = r.get("category","")
-        ts    = r.get("timestamp","")[:19]
-        table_rows.append(
-            f'<tr class="row-{rc}" data-status="{rc}" data-type="{ltype.lower()}">'
-            f'<td><a href="{r["page_url"]}" target="_blank" title="{r["page_url"]}">{page}</a></td>'
-            f'<td><a href="{r["link_url"]}" target="_blank" title="{r["link_url"]}">{link}</a></td>'
-            f'<td>{text}</td>'
-            f'<td><span class="type-tag type-{ltype.lower()}">{ltype}</span></td>'
-            f'<td>{status_pill(r["status"])}</td>'
-            f'<td>{cat}</td>'
-            f'<td>{depth}</td>'
-            f'<td>{effort_badge(r["effort"])}</td>'
-            f'<td>{ts}</td>'
-            f'</tr>'
-        )
-    table_html = "\n".join(table_rows)
+        js_rows.append({
+            "pu":  r["page_url"],               # parent url
+            "lu":  r["link_url"],               # link url
+            "lt":  r.get("link_text","")[:120], # anchor text
+            "tp":  r.get("link_type",""),        # Internal / External
+            "st":  str(r["status"]),            # http status
+            "fu":  r.get("final_url",""),        # final url after redirect
+            "dp":  r.get("depth",""),            # crawl depth
+            "ef":  r.get("effort",""),           # effort level
+            "ca":  r.get("category",""),         # category label
+            "rc":  row_class(r["status"]),       # css row class
+            "ts":  str(r.get("timestamp",""))[:19],
+        })
+    all_data_json = json.dumps(js_rows, ensure_ascii=False)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -544,106 +524,95 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {{
-    --bg: #0f172a; --surface: #1e293b; --surface2: #263348;
-    --border: #334155; --text: #e2e8f0; --muted: #94a3b8;
-    --green: #22c55e; --yellow: #f59e0b; --red: #ef4444;
-    --blue: #3b82f6; --purple: #8b5cf6; --orange: #f97316;
-    --radius: 10px;
+    --bg:#0f172a; --surface:#1e293b; --surface2:#263348;
+    --border:#334155; --text:#e2e8f0; --muted:#94a3b8;
+    --green:#22c55e; --yellow:#f59e0b; --red:#ef4444;
+    --blue:#3b82f6; --purple:#8b5cf6; --orange:#f97316;
+    --radius:10px;
   }}
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px; }}
-  a {{ color: #60a5fa; text-decoration: none; }}
-  a:hover {{ text-decoration: underline; }}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px}}
+  a{{color:#60a5fa;text-decoration:none}} a:hover{{text-decoration:underline}}
 
-  /* ── HEADER ── */
-  .header {{ background: var(--surface); border-bottom: 1px solid var(--border); padding: 20px 32px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }}
-  .header h1 {{ font-size: 1.4rem; font-weight: 700; }}
-  .header h1 span {{ color: var(--blue); }}
-  .meta {{ color: var(--muted); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; }}
-  .meta b {{ color: var(--text); }}
+  .header{{background:var(--surface);border-bottom:1px solid var(--border);padding:18px 28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}}
+  .header h1{{font-size:1.3rem;font-weight:700}} .header h1 span{{color:var(--blue)}}
+  .meta{{color:var(--muted);font-size:12px;display:flex;gap:16px;flex-wrap:wrap}} .meta b{{color:var(--text)}}
+  .hdr-btns{{display:flex;gap:8px}}
 
-  /* ── LAYOUT ── */
-  .container {{ max-width: 1600px; margin: 0 auto; padding: 24px 32px; }}
+  .container{{max-width:1600px;margin:0 auto;padding:20px 28px}}
 
-  /* ── CARDS ── */
-  .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 28px; }}
-  .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; }}
-  .card .val {{ font-size: 2rem; font-weight: 800; line-height: 1; margin-bottom: 4px; }}
-  .card .lbl {{ color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }}
-  .card.c-green .val {{ color: var(--green); }}
-  .card.c-red   .val {{ color: var(--red); }}
-  .card.c-yellow .val {{ color: var(--yellow); }}
-  .card.c-blue  .val {{ color: var(--blue); }}
-  .card.c-orange .val {{ color: var(--orange); }}
-  .card.c-purple .val {{ color: var(--purple); }}
-  .card.c-white  .val {{ color: var(--text); }}
+  .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:24px}}
+  .card{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;cursor:pointer;transition:border-color .15s}}
+  .card:hover{{border-color:var(--blue)}}
+  .card.active{{border-color:var(--blue);background:var(--surface2)}}
+  .card .val{{font-size:1.9rem;font-weight:800;line-height:1;margin-bottom:4px}}
+  .card .lbl{{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}}
+  .c-green .val{{color:var(--green)}} .c-red .val{{color:var(--red)}}
+  .c-yellow .val{{color:var(--yellow)}} .c-blue .val{{color:var(--blue)}}
+  .c-orange .val{{color:var(--orange)}} .c-purple .val{{color:var(--purple)}}
+  .c-white .val{{color:var(--text)}}
 
-  /* ── CHARTS ── */
-  .charts {{ display: grid; grid-template-columns: 340px 1fr; gap: 20px; margin-bottom: 28px; }}
-  @media(max-width:900px){{ .charts{{ grid-template-columns:1fr; }} }}
-  .chart-box {{ background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }}
-  .chart-box h2 {{ font-size: .9rem; font-weight: 600; margin-bottom: 16px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
-  .chart-box canvas {{ max-height: 280px; }}
+  .charts{{display:grid;grid-template-columns:320px 1fr;gap:18px;margin-bottom:24px}}
+  @media(max-width:860px){{.charts{{grid-template-columns:1fr}}}}
+  .chart-box{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px}}
+  .chart-box h2{{font-size:.8rem;font-weight:600;margin-bottom:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}}
+  .chart-box canvas{{max-height:260px}}
 
-  /* ── FILTERS ── */
-  .filters {{ background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 20px; margin-bottom: 16px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }}
-  .filters label {{ color: var(--muted); font-size: 12px; margin-right: 4px; }}
-  .filters input, .filters select {{
-    background: var(--surface2); border: 1px solid var(--border); color: var(--text);
-    padding: 7px 12px; border-radius: 6px; font-size: 13px; outline: none;
-  }}
-  .filters input {{ width: 260px; }}
-  .filters input:focus, .filters select:focus {{ border-color: var(--blue); }}
-  .filters .count {{ margin-left: auto; color: var(--muted); font-size: 12px; }}
-  .btn {{ background: var(--blue); color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; }}
-  .btn:hover {{ background: #2563eb; }}
-  .btn-ghost {{ background: transparent; border: 1px solid var(--border); color: var(--muted); }}
-  .btn-ghost:hover {{ border-color: var(--blue); color: var(--text); }}
+  .filters{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;margin-bottom:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}}
+  .filters label{{color:var(--muted);font-size:12px;margin-right:3px}}
+  .filters input,.filters select{{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 11px;border-radius:6px;font-size:13px;outline:none}}
+  .filters input{{width:240px}}
+  .filters input:focus,.filters select:focus{{border-color:var(--blue)}}
+  .info{{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap}}
 
-  /* ── TABLE ── */
-  .table-wrap {{ background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: auto; }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  thead th {{ background: var(--surface2); padding: 10px 14px; text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); border-bottom: 1px solid var(--border); white-space: nowrap; cursor: pointer; user-select: none; }}
-  thead th:hover {{ color: var(--text); }}
-  tbody tr {{ border-bottom: 1px solid var(--border); transition: background .1s; }}
-  tbody tr:last-child {{ border-bottom: none; }}
-  tbody tr:hover {{ background: var(--surface2); }}
-  td {{ padding: 9px 14px; vertical-align: middle; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .btn{{background:var(--blue);color:#fff;border:none;padding:7px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}}
+  .btn:hover{{background:#2563eb}}
+  .btn-ghost{{background:transparent;border:1px solid var(--border);color:var(--muted)}}
+  .btn-ghost:hover{{border-color:var(--blue);color:var(--text)}}
 
-  /* row colours */
-  .row-ok       {{ }}
-  .row-redirect {{ background: rgba(245,158,11,.04); }}
-  .row-broken   {{ background: rgba(239,68,68,.07); }}
-  .row-warn     {{ background: rgba(249,115,22,.05); }}
-  .row-servererr{{ background: rgba(139,92,246,.05); }}
-  .row-unkn     {{ background: rgba(148,163,184,.04); }}
+  .table-wrap{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:auto}}
+  table{{width:100%;border-collapse:collapse}}
+  thead th{{background:var(--surface2);padding:9px 13px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none}}
+  thead th:hover{{color:var(--text)}}
+  tbody tr{{border-bottom:1px solid var(--border)}}
+  tbody tr:hover{{background:var(--surface2)}}
+  td{{padding:8px 13px;vertical-align:middle;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 
-  /* ── PILLS & BADGES ── */
-  .status-pill {{ display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: 12px; font-weight: 700; }}
-  .pill-ok        {{ background: rgba(34,197,94,.15);  color: #4ade80; }}
-  .pill-redirect  {{ background: rgba(245,158,11,.15); color: #fbbf24; }}
-  .pill-broken    {{ background: rgba(239,68,68,.2);   color: #f87171; }}
-  .pill-warn      {{ background: rgba(249,115,22,.15); color: #fb923c; }}
-  .pill-servererr {{ background: rgba(139,92,246,.15); color: #a78bfa; }}
-  .pill-unkn      {{ background: rgba(148,163,184,.15);color: #94a3b8; }}
+  .row-redirect{{background:rgba(245,158,11,.04)}}
+  .row-broken{{background:rgba(239,68,68,.07)}}
+  .row-warn{{background:rgba(249,115,22,.05)}}
+  .row-servererr{{background:rgba(139,92,246,.05)}}
+  .row-unkn{{background:rgba(148,163,184,.04)}}
 
-  .type-tag {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }}
-  .type-internal {{ background: rgba(59,130,246,.15); color: #93c5fd; }}
-  .type-external {{ background: rgba(139,92,246,.15); color: #c4b5fd; }}
-  .type-page     {{ background: rgba(148,163,184,.15);color: #94a3b8; }}
+  .pill{{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:700}}
+  .p-ok{{background:rgba(34,197,94,.15);color:#4ade80}}
+  .p-redirect{{background:rgba(245,158,11,.15);color:#fbbf24}}
+  .p-broken{{background:rgba(239,68,68,.2);color:#f87171}}
+  .p-warn{{background:rgba(249,115,22,.15);color:#fb923c}}
+  .p-servererr{{background:rgba(139,92,246,.15);color:#a78bfa}}
+  .p-unkn{{background:rgba(148,163,184,.15);color:#94a3b8}}
 
-  .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }}
-  .badge-none   {{ background: rgba(34,197,94,.1);   color: #4ade80; }}
-  .badge-low    {{ background: rgba(245,158,11,.1);  color: #fbbf24; }}
-  .badge-lowmed {{ background: rgba(249,115,22,.1);  color: #fb923c; }}
-  .badge-med    {{ background: rgba(139,92,246,.1);  color: #a78bfa; }}
-  .badge-high   {{ background: rgba(239,68,68,.15);  color: #f87171; }}
+  .tt{{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600}}
+  .tt-internal{{background:rgba(59,130,246,.15);color:#93c5fd}}
+  .tt-external{{background:rgba(139,92,246,.15);color:#c4b5fd}}
+  .tt-page{{background:rgba(148,163,184,.15);color:#94a3b8}}
 
-  /* ── HIDDEN ── */
-  .hidden {{ display: none !important; }}
-  .sort-icon {{ opacity: .4; font-size: 10px; }}
-  .sort-asc .sort-icon::after  {{ content: " ▲"; opacity:1; }}
-  .sort-desc .sort-icon::after {{ content: " ▼"; opacity:1; }}
+  .bdg{{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600}}
+  .b-none{{background:rgba(34,197,94,.1);color:#4ade80}}
+  .b-low{{background:rgba(245,158,11,.1);color:#fbbf24}}
+  .b-lowmed{{background:rgba(249,115,22,.1);color:#fb923c}}
+  .b-med{{background:rgba(139,92,246,.1);color:#a78bfa}}
+  .b-high{{background:rgba(239,68,68,.15);color:#f87171}}
+
+  .pagination{{display:flex;align-items:center;gap:8px;padding:12px 16px;border-top:1px solid var(--border);flex-wrap:wrap}}
+  .pagination button{{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 12px;border-radius:5px;cursor:pointer;font-size:12px}}
+  .pagination button:hover{{border-color:var(--blue)}}
+  .pagination button:disabled{{opacity:.35;cursor:not-allowed}}
+  .pagination button.active{{background:var(--blue);border-color:var(--blue);color:#fff}}
+  .pagination .pginfo{{color:var(--muted);font-size:12px;margin:0 6px}}
+
+  .sort-asc::after{{content:" ▲";opacity:.8;font-size:9px}}
+  .sort-desc::after{{content:" ▼";opacity:.8;font-size:9px}}
 </style>
 </head>
 <body>
@@ -654,26 +623,28 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
     <div class="meta">
       <span>Run date: <b>{run_date}</b></span>
       <span>Duration: <b>{run_time}</b></span>
-      <span>Max depth: <b>{CONFIG["MAX_DEPTH"]}</b></span>
+      <span>Depth: <b>{CONFIG["MAX_DEPTH"]}</b></span>
       <span>Workers: <b>{CONFIG["CONCURRENCY"]}</b></span>
     </div>
   </div>
-  <button class="btn" onclick="exportCSV()">⬇ Export CSV</button>
+  <div class="hdr-btns">
+    <button class="btn btn-ghost" onclick="exportCSV()">⬇ Export CSV</button>
+  </div>
 </div>
 
 <div class="container">
 
-  <!-- SUMMARY CARDS -->
+  <!-- SUMMARY CARDS — clicking a card filters the table -->
   <div class="cards">
-    <div class="card c-white">  <div class="val">{total_pages:,}</div><div class="lbl">Pages Crawled</div></div>
-    <div class="card c-white">  <div class="val">{total_links:,}</div><div class="lbl">Total Links</div></div>
-    <div class="card c-green">  <div class="val">{ok_links:,}</div>   <div class="lbl">200 OK</div></div>
-    <div class="card c-yellow"> <div class="val">{redirects:,}</div>  <div class="lbl">Redirects (3xx)</div></div>
-    <div class="card c-red">    <div class="val">{broken:,}</div>     <div class="lbl">Broken (404/410)</div></div>
-    <div class="card c-purple"> <div class="val">{server_errors:,}</div><div class="lbl">Server Errors (5xx)</div></div>
-    <div class="card c-orange"> <div class="val">{errors:,}</div>     <div class="lbl">Timeout / Conn. Error</div></div>
-    <div class="card c-blue">   <div class="val">{internal:,}</div>   <div class="lbl">Internal Links</div></div>
-    <div class="card c-white">  <div class="val">{external:,}</div>   <div class="lbl">External Links</div></div>
+    <div class="card c-white" onclick="cardFilter('')"         id="card-all">      <div class="val">{total_pages:,}</div><div class="lbl">Parent Pages</div></div>
+    <div class="card c-white" onclick="cardFilter('')"         id="card-links">    <div class="val">{total_links:,}</div><div class="lbl">Total Links</div></div>
+    <div class="card c-green" onclick="cardFilter('ok')"       id="card-ok">       <div class="val">{ok_links:,}</div>  <div class="lbl">200 OK</div></div>
+    <div class="card c-yellow"onclick="cardFilter('redirect')" id="card-redirect"> <div class="val">{redirects:,}</div> <div class="lbl">Redirects (3xx)</div></div>
+    <div class="card c-red"   onclick="cardFilter('broken')"   id="card-broken">   <div class="val">{broken:,}</div>   <div class="lbl">Broken (404/410)</div></div>
+    <div class="card c-purple"onclick="cardFilter('servererr')"id="card-5xx">      <div class="val">{server_errors:,}</div><div class="lbl">Server Errors (5xx)</div></div>
+    <div class="card c-orange"onclick="cardFilter('unkn')"     id="card-err">      <div class="val">{errors:,}</div>   <div class="lbl">Timeout / Error</div></div>
+    <div class="card c-blue"  onclick="typeFilter2('internal')"id="card-int">      <div class="val">{internal:,}</div> <div class="lbl">Internal Links</div></div>
+    <div class="card c-white" onclick="typeFilter2('external')"id="card-ext">      <div class="val">{external:,}</div> <div class="lbl">External Links</div></div>
   </div>
 
   <!-- CHARTS -->
@@ -683,175 +654,291 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
       <canvas id="donut"></canvas>
     </div>
     <div class="chart-box">
-      <h2>Top Pages by Broken Links</h2>
+      <h2>Top Parent Pages by Broken / Error Links</h2>
       <canvas id="bar"></canvas>
     </div>
   </div>
 
   <!-- FILTERS -->
   <div class="filters">
-    <div>
-      <label>Search</label>
-      <input type="text" id="search" placeholder="Filter URL or anchor text…" oninput="applyFilters()">
-    </div>
-    <div>
-      <label>Status</label>
+    <div><label>Search</label>
+      <input type="text" id="search" placeholder="Filter by URL or anchor text…" oninput="applyFilters()"></div>
+    <div><label>Status</label>
       <select id="statusFilter" onchange="applyFilters()">
-        <option value="all">All</option>
+        <option value="">All Statuses</option>
         <option value="ok">200 OK</option>
         <option value="redirect">Redirect (3xx)</option>
         <option value="broken">Broken (404/410)</option>
         <option value="warn">4xx Other</option>
         <option value="servererr">5xx Server Error</option>
         <option value="unkn">Timeout / Error</option>
-      </select>
-    </div>
-    <div>
-      <label>Type</label>
+      </select></div>
+    <div><label>Type</label>
       <select id="typeFilter" onchange="applyFilters()">
-        <option value="all">All</option>
-        <option value="internal">Internal</option>
-        <option value="external">External</option>
-      </select>
-    </div>
+        <option value="">All Types</option>
+        <option value="Internal">Internal</option>
+        <option value="External">External</option>
+      </select></div>
+    <div><label>Effort</label>
+      <select id="effortFilter" onchange="applyFilters()">
+        <option value="">All Efforts</option>
+        <option value="High">High</option>
+        <option value="Medium">Medium</option>
+        <option value="Low">Low</option>
+        <option value="None">None</option>
+      </select></div>
     <button class="btn btn-ghost" onclick="resetFilters()">Reset</button>
-    <span class="count" id="rowCount"></span>
+    <span class="info" id="rowInfo"></span>
   </div>
 
   <!-- TABLE -->
   <div class="table-wrap">
-    <table id="resultsTable">
-      <thead>
+    <table>
+      <thead id="thead">
         <tr>
-          <th onclick="sortTable(0)">Page URL <span class="sort-icon"></span></th>
-          <th onclick="sortTable(1)">Link URL <span class="sort-icon"></span></th>
-          <th onclick="sortTable(2)">Anchor Text <span class="sort-icon"></span></th>
-          <th onclick="sortTable(3)">Type <span class="sort-icon"></span></th>
-          <th onclick="sortTable(4)">Status <span class="sort-icon"></span></th>
-          <th onclick="sortTable(5)">Category <span class="sort-icon"></span></th>
-          <th onclick="sortTable(6)">Depth <span class="sort-icon"></span></th>
-          <th onclick="sortTable(7)">Effort <span class="sort-icon"></span></th>
-          <th onclick="sortTable(8)">Timestamp <span class="sort-icon"></span></th>
+          <th onclick="sortBy(0)">Parent URL</th>
+          <th onclick="sortBy(1)">Link URL</th>
+          <th onclick="sortBy(2)">Anchor Text</th>
+          <th onclick="sortBy(3)">Type</th>
+          <th onclick="sortBy(4)">Status</th>
+          <th onclick="sortBy(5)">Category</th>
+          <th onclick="sortBy(6)">Depth</th>
+          <th onclick="sortBy(7)">Effort</th>
+          <th onclick="sortBy(8)">Timestamp</th>
         </tr>
       </thead>
-      <tbody id="tableBody">
-{table_html}
-      </tbody>
+      <tbody id="tbody"></tbody>
     </table>
+    <div class="pagination" id="pager"></div>
   </div>
 
-</div><!-- /container -->
+</div>
 
+<!-- ALL DATA — never touched by DOM operations, only read by JS -->
 <script>
-// ── CHARTS ──────────────────────────────────────
-const donutCtx = document.getElementById('donut').getContext('2d');
-new Chart(donutCtx, {{
-  type: 'doughnut',
-  data: {{
-    labels: {chart_labels},
-    datasets: [{{ data: {chart_values}, backgroundColor: {chart_colors}, borderWidth: 2, borderColor: '#1e293b' }}]
+const ALL_DATA = {all_data_json};
+const PAGE_SIZE = {PAGE_SIZE};
+
+let filtered  = ALL_DATA.slice();
+let sortCol   = -1;
+let sortAsc   = true;
+let curPage   = 0;
+
+// ── CHARTS ──────────────────────────────────────────────────
+new Chart(document.getElementById('donut').getContext('2d'), {{
+  type:'doughnut',
+  data:{{
+    labels:{chart_labels},
+    datasets:[{{data:{chart_values},backgroundColor:{chart_colors},borderWidth:2,borderColor:'#1e293b'}}]
   }},
-  options: {{
-    responsive: true,
-    plugins: {{
-      legend: {{ position: 'bottom', labels: {{ color: '#94a3b8', padding: 14, font: {{ size: 12 }} }} }},
-      tooltip: {{ callbacks: {{ label: ctx => ` ${{ctx.label}}: ${{ctx.parsed.toLocaleString()}}` }} }}
+  options:{{responsive:true,plugins:{{
+    legend:{{position:'bottom',labels:{{color:'#94a3b8',padding:12,font:{{size:12}}}}}},
+    tooltip:{{callbacks:{{label:ctx=>` ${{ctx.label}}: ${{ctx.parsed.toLocaleString()}}`}}}}
+  }}}}
+}});
+
+new Chart(document.getElementById('bar').getContext('2d'), {{
+  type:'bar',
+  data:{{
+    labels:{bar_labels},
+    datasets:[{{label:'Broken / Error Links',data:{bar_values},backgroundColor:'rgba(239,68,68,0.7)',borderRadius:4}}]
+  }},
+  options:{{
+    indexAxis:'y',responsive:true,
+    plugins:{{legend:{{display:false}},tooltip:{{callbacks:{{label:ctx=>` ${{ctx.parsed.x}} issues`}}}}}},
+    scales:{{
+      x:{{grid:{{color:'#334155'}},ticks:{{color:'#94a3b8'}}}},
+      y:{{grid:{{display:false}},ticks:{{color:'#94a3b8',font:{{size:11}}}}}}
     }}
   }}
 }});
 
-const barCtx = document.getElementById('bar').getContext('2d');
-new Chart(barCtx, {{
-  type: 'bar',
-  data: {{
-    labels: {bar_labels},
-    datasets: [{{ label: 'Broken Links', data: {bar_values},
-      backgroundColor: 'rgba(239,68,68,0.7)', borderRadius: 4 }}]
-  }},
-  options: {{
-    indexAxis: 'y',
-    responsive: true,
-    plugins: {{ legend: {{ display: false }},
-      tooltip: {{ callbacks: {{ label: ctx => ` ${{ctx.parsed.x}} broken links` }} }} }},
-    scales: {{
-      x: {{ grid: {{ color: '#334155' }}, ticks: {{ color: '#94a3b8' }} }},
-      y: {{ grid: {{ display: false }}, ticks: {{ color: '#94a3b8', font: {{ size: 11 }} }} }}
-    }}
-  }}
-}});
+// ── PILL / BADGE HELPERS ─────────────────────────────────────
+function statusPill(rc, st) {{
+  return `<span class="pill p-${{rc}}">${{st}}</span>`;
+}}
+function typeBadge(tp) {{
+  const c = tp.toLowerCase();
+  return `<span class="tt tt-${{c}}">${{tp}}</span>`;
+}}
+function effortBadge(ef) {{
+  const map = {{'None':'b-none','Low':'b-low','Low-Medium':'b-lowmed','Medium':'b-med','High':'b-high'}};
+  return `<span class="bdg ${{map[ef]||'b-med'}}">${{ef}}</span>`;
+}}
+function esc(s) {{
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}}
+function short(s,n) {{
+  return s.length>n ? s.slice(0,n)+'…' : s;
+}}
 
-// ── FILTER / SORT ────────────────────────────────
-let sortCol = -1, sortAsc = true;
+// ── RENDER PAGE ──────────────────────────────────────────────
+// Only PAGE_SIZE <tr> nodes are ever in the DOM at once.
+function renderPage(page) {{
+  curPage = page;
+  const start = page * PAGE_SIZE;
+  const slice = filtered.slice(start, start + PAGE_SIZE);
+  const tbody = document.getElementById('tbody');
+
+  // Build HTML string then set innerHTML once — single reflow
+  const html = slice.map(r => `
+    <tr class="row-${{r.rc}}">
+      <td title="${{esc(r.pu)}}"><a href="${{esc(r.pu)}}" target="_blank">${{esc(short(r.pu,70))}}</a></td>
+      <td title="${{esc(r.lu)}}"><a href="${{esc(r.lu)}}" target="_blank">${{esc(short(r.lu,70))}}</a></td>
+      <td title="${{esc(r.lt)}}">${{esc(short(r.lt,50))}}</td>
+      <td>${{typeBadge(r.tp||'Page')}}</td>
+      <td>${{statusPill(r.rc, r.st)}}</td>
+      <td>${{esc(r.ca)}}</td>
+      <td>${{esc(r.dp)}}</td>
+      <td>${{effortBadge(r.ef)}}</td>
+      <td>${{esc(r.ts)}}</td>
+    </tr>`).join('');
+  tbody.innerHTML = html;
+
+  renderPager();
+  document.getElementById('rowInfo').textContent =
+    `${{filtered.length.toLocaleString()}} rows · page ${{page+1}} of ${{Math.max(1,Math.ceil(filtered.length/PAGE_SIZE))}}`;
+}}
+
+// ── PAGINATOR ────────────────────────────────────────────────
+function renderPager() {{
+  const total   = Math.ceil(filtered.length / PAGE_SIZE);
+  const pager   = document.getElementById('pager');
+  if (total <= 1) {{ pager.innerHTML = ''; return; }}
+
+  const maxBtns = 9;
+  let pages = [];
+  if (total <= maxBtns) {{
+    pages = Array.from({{length:total}},(_,i)=>i);
+  }} else {{
+    pages = [0];
+    let lo = Math.max(1, curPage-3), hi = Math.min(total-2, curPage+3);
+    if (lo > 1)       pages.push('…');
+    for (let i=lo;i<=hi;i++) pages.push(i);
+    if (hi < total-2) pages.push('…');
+    pages.push(total-1);
+  }}
+
+  pager.innerHTML =
+    `<button onclick="renderPage(${{curPage-1}})" ${{curPage===0?'disabled':''}}>‹ Prev</button>` +
+    pages.map(p => p==='…'
+      ? `<span class="pginfo">…</span>`
+      : `<button class="${{p===curPage?'active':''}}" onclick="renderPage(${{p}})">${{p+1}}</button>`
+    ).join('') +
+    `<button onclick="renderPage(${{curPage+1}})" ${{curPage>=total-1?'disabled':''}}>Next ›</button>`;
+}}
+
+// ── FILTER ───────────────────────────────────────────────────
+let searchTimer = null;
 
 function applyFilters() {{
-  const q     = document.getElementById('search').value.toLowerCase();
-  const stat  = document.getElementById('statusFilter').value;
-  const type  = document.getElementById('typeFilter').value;
-  const rows  = document.querySelectorAll('#tableBody tr');
-  let vis = 0;
-  rows.forEach(r => {{
-    const text   = r.innerText.toLowerCase();
-    const ds     = r.dataset.status;
-    const dt     = r.dataset.type;
-    const matchQ = !q || text.includes(q);
-    const matchS = stat === 'all' || ds === stat;
-    const matchT = type === 'all' || dt === type;
-    const show   = matchQ && matchS && matchT;
-    r.classList.toggle('hidden', !show);
-    if (show) vis++;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(_applyFilters, 120);  // debounce search input
+}}
+
+function _applyFilters() {{
+  const q  = document.getElementById('search').value.toLowerCase().trim();
+  const st = document.getElementById('statusFilter').value;
+  const tp = document.getElementById('typeFilter').value;
+  const ef = document.getElementById('effortFilter').value;
+
+  filtered = ALL_DATA.filter(r => {{
+    if (st && r.rc  !== st)  return false;
+    if (tp && r.tp  !== tp)  return false;
+    if (ef && r.ef  !== ef)  return false;
+    if (q  && !( r.pu.toLowerCase().includes(q) ||
+                 r.lu.toLowerCase().includes(q) ||
+                 r.lt.toLowerCase().includes(q) )) return false;
+    return true;
   }});
-  document.getElementById('rowCount').textContent = vis.toLocaleString() + ' rows shown';
+
+  if (sortCol >= 0) sortFiltered();
+  renderPage(0);
+  updateCardHighlight();
 }}
 
 function resetFilters() {{
-  document.getElementById('search').value = '';
-  document.getElementById('statusFilter').value = 'all';
-  document.getElementById('typeFilter').value   = 'all';
-  applyFilters();
+  document.getElementById('search').value   = '';
+  document.getElementById('statusFilter').value = '';
+  document.getElementById('typeFilter').value   = '';
+  document.getElementById('effortFilter').value  = '';
+  filtered  = ALL_DATA.slice();
+  sortCol   = -1;
+  sortAsc   = true;
+  document.querySelectorAll('#thead th').forEach(th=>{{
+    th.classList.remove('sort-asc','sort-desc');
+  }});
+  document.querySelectorAll('.card').forEach(c=>c.classList.remove('active'));
+  renderPage(0);
 }}
 
-function sortTable(col) {{
-  const tbody = document.getElementById('tableBody');
-  const rows  = Array.from(tbody.querySelectorAll('tr'));
-  const ths   = document.querySelectorAll('thead th');
+// ── CARD QUICK FILTERS ───────────────────────────────────────
+function cardFilter(rc) {{
+  document.getElementById('statusFilter').value = rc;
+  document.getElementById('typeFilter').value   = '';
+  document.getElementById('effortFilter').value  = '';
+  document.getElementById('search').value        = '';
+  _applyFilters();
+}}
+function typeFilter2(tp) {{
+  document.getElementById('typeFilter').value   = tp.charAt(0).toUpperCase()+tp.slice(1);
+  document.getElementById('statusFilter').value = '';
+  document.getElementById('effortFilter').value  = '';
+  document.getElementById('search').value        = '';
+  _applyFilters();
+}}
+function updateCardHighlight() {{
+  const st = document.getElementById('statusFilter').value;
+  const tp = document.getElementById('typeFilter').value.toLowerCase();
+  document.querySelectorAll('.card').forEach(c=>c.classList.remove('active'));
+  const map = {{'ok':'card-ok','redirect':'card-redirect','broken':'card-broken',
+                'servererr':'card-5xx','unkn':'card-err'}};
+  if (map[st])          document.getElementById(map[st])?.classList.add('active');
+  if (tp==='internal')  document.getElementById('card-int')?.classList.add('active');
+  if (tp==='external')  document.getElementById('card-ext')?.classList.add('active');
+}}
 
+// ── SORT ─────────────────────────────────────────────────────
+const SORT_KEYS = ['pu','lu','lt','tp','st','ca','dp','ef','ts'];
+
+function sortBy(col) {{
   if (sortCol === col) {{ sortAsc = !sortAsc; }}
   else {{ sortCol = col; sortAsc = true; }}
-
-  ths.forEach((th,i) => {{
+  document.querySelectorAll('#thead th').forEach((th,i) => {{
     th.classList.remove('sort-asc','sort-desc');
-    if (i === col) th.classList.add(sortAsc ? 'sort-asc' : 'sort-desc');
+    if (i===col) th.classList.add(sortAsc?'sort-asc':'sort-desc');
   }});
+  sortFiltered();
+  renderPage(0);
+}}
 
-  rows.sort((a,b) => {{
-    const va = a.cells[col]?.innerText.trim() ?? '';
-    const vb = b.cells[col]?.innerText.trim() ?? '';
+function sortFiltered() {{
+  const key = SORT_KEYS[sortCol];
+  filtered.sort((a,b) => {{
+    const va = String(a[key]??''), vb = String(b[key]??'');
     const n  = Number(va) - Number(vb);
     const cmp = isNaN(n) ? va.localeCompare(vb) : n;
     return sortAsc ? cmp : -cmp;
   }});
-  rows.forEach(r => tbody.appendChild(r));
-  applyFilters();
 }}
 
-// ── CSV EXPORT ───────────────────────────────────
+// ── CSV EXPORT (exports filtered data, not just current page) ─
 function exportCSV() {{
-  const rows = Array.from(document.querySelectorAll('#tableBody tr:not(.hidden)'));
-  const headers = Array.from(document.querySelectorAll('thead th')).map(th => th.innerText.replace(/[▲▼]/g,'').trim());
+  const headers = ['Parent URL','Link URL','Anchor Text','Type','Status',
+                   'Category','Depth','Effort','Timestamp'];
+  const keys    = ['pu','lu','lt','tp','st','ca','dp','ef','ts'];
   const lines   = [headers.join(',')];
-  rows.forEach(r => {{
-    const cells = Array.from(r.cells).map(c => '"' + c.innerText.replace(/"/g,'""') + '"');
-    lines.push(cells.join(','));
+  filtered.forEach(r => {{
+    lines.push(keys.map(k => '"' + String(r[k]??'').replace(/"/g,'""') + '"').join(','));
   }});
   const blob = new Blob([lines.join('\\n')], {{type:'text/csv'}});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'broken_links_filtered.csv';
+  const a = Object.assign(document.createElement('a'),
+    {{href:URL.createObjectURL(blob), download:'broken_links_filtered.csv'}});
   a.click();
 }}
 
-// initialise count
-applyFilters();
+// ── INIT ─────────────────────────────────────────────────────
+renderPage(0);
 </script>
 </body>
 </html>"""
@@ -890,6 +977,12 @@ async def main():
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
     log.info("HTML report written → %s", html_path)
+
+    # Also write index.html — GitHub Pages always serves this as the latest report
+    index_path = str(output_dir / "index.html")
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    log.info("index.html written → %s (used by GitHub Pages)", index_path)
 
     # Summary to stdout (picked up by GitHub Actions step summary)
     broken = sum(1 for r in results if str(r["status"]) in ("404","410","451"))
