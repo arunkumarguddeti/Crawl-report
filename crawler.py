@@ -17,10 +17,23 @@ import sys
 import time
 import logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urljoin, urlparse, urlunparse, urlencode, parse_qs
 from urllib.robotparser import RobotFileParser
 from pathlib import Path
+
+# Eastern Time (handles EST/EDT automatically)
+TZ_EASTERN = ZoneInfo("America/New_York")
+
+def now_est() -> datetime:
+    return datetime.now(TZ_EASTERN)
+
+def fmt_duration(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}"
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIG  — edit these or override with environment variables
@@ -44,6 +57,25 @@ CONFIG = {
                         ".gif",".svg",".webp",".ico",".woff",".woff2",".ttf"},
     # Schemes that are not HTTP — skip entirely
     "SKIP_SCHEMES":    {"mailto","tel","javascript","data","ftp","sms","callto"},
+
+    # ── Queue explosion guard ──────────────────────────────────────────────
+    # Hard cap on queue size. Tag/category/pagination pages on WordPress and
+    # similar CMSes can push the queue to 30,000+ entries. When this cap is
+    # hit new URLs are silently dropped — already-queued pages still run.
+    "MAX_QUEUE":   int(os.getenv("MAX_QUEUE", "5000")),
+
+    # URL path fragments that signal crawl-trap pages.
+    # URLs containing any of these strings will NOT be added to the crawl
+    # queue (their HTTP status is still HEAD-checked once as a link).
+    # Override via env var TRAP_PATTERNS as comma-separated strings.
+    "TRAP_PATTERNS": set(
+        os.getenv("TRAP_PATTERNS",
+            "/page/,/tag/,/tags/,/category/,/categories/,"
+            "/author/,/feed/,/rss/,/wp-json/,/wp-admin/,"
+            "/search/,/?s=,/?p=,/paged=,/archive/,/archives/,"
+            "/?query=,/?q=,/page="
+        ).split(",")
+    ),
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -199,40 +231,42 @@ async def check_link_status(session: aiohttp.ClientSession,
                              url: str,
                              link_cache: dict) -> tuple:
     """
-    HEAD (then GET fallback) a URL to get status + final URL.
-    Uses link_cache to avoid duplicate requests.
+    HEAD (then GET fallback) a URL.
+    Returns (status, final_url, load_ms) — cached to avoid duplicate requests.
     """
     if url in link_cache:
         return link_cache[url]
 
     headers = {"User-Agent": CONFIG["USER_AGENT"]}
     timeout = aiohttp.ClientTimeout(total=CONFIG["TIMEOUT"])
+    t0 = time.monotonic()
     try:
         async with session.head(url, headers=headers, timeout=timeout,
                                 allow_redirects=True, ssl=False) as resp:
+            load_ms = round((time.monotonic() - t0) * 1000)
             if resp.status == 405:
-                # HEAD not allowed — fall back to GET
                 raise aiohttp.ClientResponseError(
                     resp.request_info, resp.history, status=405)
-            result = (resp.status, str(resp.url))
+            result = (resp.status, str(resp.url), load_ms)
     except aiohttp.ClientResponseError:
-        # Fallback to GET for 405 or other HEAD failures
+        t0 = time.monotonic()
         try:
             async with session.get(url, headers=headers, timeout=timeout,
                                    allow_redirects=True, ssl=False) as resp:
-                result = (resp.status, str(resp.url))
+                load_ms = round((time.monotonic() - t0) * 1000)
+                result = (resp.status, str(resp.url), load_ms)
         except asyncio.TimeoutError:
-            result = ("Timeout", url)
+            result = ("Timeout", url, -1)
         except Exception as e:
-            result = (f"Error: {type(e).__name__}", url)
+            result = (f"Error: {type(e).__name__}", url, -1)
     except asyncio.TimeoutError:
-        result = ("Timeout", url)
+        result = ("Timeout", url, -1)
     except aiohttp.ClientSSLError:
-        result = ("SSL Error", url)
+        result = ("SSL Error", url, -1)
     except aiohttp.ClientConnectorError:
-        result = ("Connection Error", url)
+        result = ("Connection Error", url, -1)
     except Exception as e:
-        result = (f"Error: {type(e).__name__}", url)
+        result = (f"Error: {type(e).__name__}", url, -1)
 
     link_cache[url] = result
     return result
@@ -306,23 +340,64 @@ def extract_links(html: str, page_url: str) -> list[tuple[str, str]]:
 #  MAIN CRAWL  (BFS + async 10-worker semaphore)
 # ──────────────────────────────────────────────
 
+def is_trap_url(url: str) -> bool:
+    """
+    Returns True if the URL matches a known crawl-trap pattern
+    (pagination, tag archives, feeds, admin panels, etc.).
+    These pages are HEAD-checked for broken-link purposes but are
+    NOT crawled for further links — stopping queue explosion.
+    """
+    lower = url.lower()
+    return any(pat.strip() and pat.strip() in lower
+               for pat in CONFIG["TRAP_PATTERNS"])
+
+
+def safe_enqueue(queue: deque, seen: set, url: str, depth: int) -> bool:
+    """
+    Add a URL to the crawl queue only when ALL conditions are met:
+      1. Not already seen (visited or previously queued)
+      2. Queue is below MAX_QUEUE hard cap
+      3. Not a trap URL pattern
+      4. Not a binary/skip-parse extension
+    Returns True if the URL was queued.
+    """
+    if url in seen:
+        return False
+    if len(queue) >= CONFIG["MAX_QUEUE"]:
+        return False
+    if is_trap_url(url):
+        return False
+    if should_skip_parse(url):
+        return False
+    seen.add(url)
+    queue.append((url, depth))
+    return True
+
+
 async def crawl() -> list[dict]:
     base_url = CONFIG["BASE_URL"].rstrip("/")
-    sem = asyncio.Semaphore(CONFIG["CONCURRENCY"])
+    sem      = asyncio.Semaphore(CONFIG["CONCURRENCY"])
 
-    visited_pages: set[str] = set()   # pages we have crawled (HTML fetched)
-    link_cache:    dict      = {}     # url -> (status, final_url)
-    results:       list[dict]= []
+    # `seen` tracks both visited pages AND queued-but-not-yet-visited pages.
+    # This is the key fix: previously only visited_pages was checked, so the
+    # queue would grow to 33k+ with the same URLs added repeatedly by
+    # concurrent async tasks before any of them were dequeued.
+    visited_pages: set[str] = set()   # pages whose HTML has been fetched
+    seen:          set[str] = set()   # visited + queued (dedup guard)
+    link_cache:    dict     = {}      # url -> (status, final_url) cache
+    results:       list[dict] = []
+    trap_skipped:  int      = 0       # counter for reporting
 
     rp = load_robots(base_url)
 
-    # normalise the entry point
     start = normalize(base_url)
     if not start:
         log.error("BASE_URL '%s' is invalid.", base_url)
         return []
 
-    queue: deque[tuple[str, int]] = deque([(start, 0)])
+    queue: deque[tuple[str, int]] = deque()
+    seen.add(start)
+    queue.append((start, 0))
 
     connector = aiohttp.TCPConnector(
         limit=CONFIG["CONCURRENCY"] + 5,
@@ -334,20 +409,22 @@ async def crawl() -> list[dict]:
     async with aiohttp.ClientSession(connector=connector) as session:
 
         while queue:
-            # Drain batch of up to CONCURRENCY items from queue
-            batch = []
+            # ── Hard stop: MAX_PAGES reached ──────────────────────────────
+            if len(visited_pages) >= CONFIG["MAX_PAGES"]:
+                log.warning("MAX_PAGES cap (%d) reached — crawl complete.",
+                            CONFIG["MAX_PAGES"])
+                break
+
+            # ── Build next batch ──────────────────────────────────────────
+            batch: list[tuple[str, int]] = []
             while queue and len(batch) < CONFIG["CONCURRENCY"]:
                 url, depth = queue.popleft()
                 if url in visited_pages:
                     continue
-                if len(visited_pages) >= CONFIG["MAX_PAGES"]:
-                    log.warning("MAX_PAGES cap (%d) reached — stopping crawl.", CONFIG["MAX_PAGES"])
-                    queue.clear()
-                    break
                 if depth > CONFIG["MAX_DEPTH"]:
                     continue
                 if not robots_allow(rp, url):
-                    log.info("robots.txt disallows: %s", url)
+                    log.debug("robots.txt disallows: %s", url)
                     continue
                 visited_pages.add(url)
                 batch.append((url, depth))
@@ -355,25 +432,33 @@ async def crawl() -> list[dict]:
             if not batch:
                 break
 
-            log.info("Crawling batch of %d pages  |  total visited: %d  |  queue: %d",
-                     len(batch), len(visited_pages), len(queue))
+            log.info("Crawling batch of %d pages  |  visited: %d  |"
+                     "  queue: %d  |  trap-skipped: %d",
+                     len(batch), len(visited_pages),
+                     len(queue), trap_skipped)
 
+            # ── Process each page in the batch concurrently ───────────────
             async def process_page(page_url: str, depth: int):
-                async with sem:
-                    status, html, final_url = await fetch_page_html(session, page_url)
+                nonlocal trap_skipped
 
+                async with sem:
+                    status, html, final_url = await fetch_page_html(
+                        session, page_url)
+
+                # If the page itself is broken, record it and stop
                 if str(status) != "200":
                     results.append({
-                        "page_url":   page_url,
-                        "link_url":   page_url,
-                        "link_text":  "(page itself)",
-                        "link_type":  "Page",
-                        "status":     status,
-                        "final_url":  final_url,
-                        "depth":      depth,
-                        "effort":     effort_level(status),
-                        "category":   status_category(status),
-                        "timestamp":  datetime.utcnow().isoformat(timespec="seconds"),
+                        "page_url":  page_url,
+                        "link_url":  page_url,
+                        "link_text": "(page itself)",
+                        "link_type": "Page",
+                        "status":    status,
+                        "final_url": final_url,
+                        "load_ms":   -1,
+                        "depth":     depth,
+                        "effort":    effort_level(status),
+                        "category":  status_category(status),
+                        "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S EST"),
                     })
                     return
 
@@ -384,40 +469,58 @@ async def crawl() -> list[dict]:
                 if not page_links:
                     return
 
-                # Check all links on this page concurrently (cached)
+                # ── Check every link on this page (concurrent, cached) ────
                 async def check_one(link_url: str, link_text: str):
+                    nonlocal trap_skipped
                     async with sem:
-                        lnk_status, lnk_final = await check_link_status(
+                        lnk_status, lnk_final, lnk_load_ms = await check_link_status(
                             session, link_url, link_cache)
-                    link_type = "Internal" if is_same_domain(link_url, base_url) else "External"
-                    results.append({
-                        "page_url":   page_url,
-                        "link_url":   link_url,
-                        "link_text":  link_text,
-                        "link_type":  link_type,
-                        "status":     lnk_status,
-                        "final_url":  lnk_final,
-                        "depth":      depth,
-                        "effort":     effort_level(lnk_status),
-                        "category":   status_category(lnk_status),
-                        "timestamp":  datetime.utcnow().isoformat(timespec="seconds"),
-                    })
-                    # Queue internal pages for crawling
-                    if (link_type == "Internal"
-                            and str(lnk_status) in ("200", "301", "302")
-                            and link_url not in visited_pages
-                            and not should_skip_parse(link_url)):
-                        queue.append((link_url, depth + 1))
 
-                await asyncio.gather(*[check_one(lu, lt) for lu, lt in page_links])
+                    link_type = ("Internal"
+                                 if is_same_domain(link_url, base_url)
+                                 else "External")
+                    results.append({
+                        "page_url":  page_url,
+                        "link_url":  link_url,
+                        "link_text": link_text,
+                        "link_type": link_type,
+                        "status":    lnk_status,
+                        "final_url": lnk_final,
+                        "load_ms":   lnk_load_ms,
+                        "depth":     depth,
+                        "effort":    effort_level(lnk_status),
+                        "category":  status_category(lnk_status),
+                        "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S EST"),
+                    })
+
+                    # ── Decide whether to crawl this link ─────────────────
+                    if link_type != "Internal":
+                        return  # never crawl external domains
+                    if str(lnk_status) not in ("200", "301", "302"):
+                        return  # don't queue broken/errored pages
+                    if len(visited_pages) >= CONFIG["MAX_PAGES"]:
+                        return  # hard page cap — stop queueing
+
+                    # Trap-pattern check with counter for reporting
+                    if is_trap_url(link_url):
+                        trap_skipped += 1
+                        return
+
+                    # safe_enqueue checks seen + MAX_QUEUE cap + skip_parse
+                    safe_enqueue(queue, seen, link_url, depth + 1)
+
+                await asyncio.gather(
+                    *[check_one(lu, lt) for lu, lt in page_links])
 
             await asyncio.gather(*[process_page(u, d) for u, d in batch])
 
             if CONFIG["POLITE_DELAY"] > 0:
                 await asyncio.sleep(CONFIG["POLITE_DELAY"])
 
-    log.info("Crawl complete. %d pages crawled, %d link records collected.",
-             len(visited_pages), len(results))
+    log.info(
+        "Crawl complete. visited=%d  results=%d  trap-skipped=%d  "
+        "queue-remaining=%d",
+        len(visited_pages), len(results), trap_skipped, len(queue))
     return results
 
 
@@ -426,7 +529,7 @@ async def crawl() -> list[dict]:
 # ──────────────────────────────────────────────
 
 FIELDS = ["page_url","link_url","link_text","link_type",
-          "status","final_url","depth","effort","category","timestamp"]
+          "status","final_url","load_ms","depth","effort","category","timestamp"]
 
 def write_csv(results: list[dict], path: str):
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -438,16 +541,14 @@ def write_csv(results: list[dict], path: str):
 
 # ──────────────────────────────────────────────
 #  HTML REPORT GENERATION
-#  Architecture: all data stored as a JS JSON array.
-#  Only PAGE_SIZE rows are rendered into the DOM at once.
-#  Filtering/sorting runs entirely on the JS array — never
-#  touches 5000+ DOM nodes — so filtering is instant and
-#  the browser never freezes regardless of dataset size.
+#  Data stored as JS JSON — only PAGE_SIZE rows in DOM at once.
+#  All filtering/sorting runs on the JS array (never touches 5000+ DOM nodes).
+#  Excel export uses SheetJS (CDN) — no server needed, works offline.
 # ──────────────────────────────────────────────
 
 def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str:
 
-    PAGE_SIZE     = 100   # rows rendered in DOM at one time
+    PAGE_SIZE = 100
 
     total_links   = len(results)
     pages_set     = {r["page_url"] for r in results}
@@ -460,13 +561,11 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
     external      = sum(1 for r in results if r.get("link_type") == "External")
     internal      = sum(1 for r in results if r.get("link_type") == "Internal")
 
-    # Category counts for doughnut chart
     cat_counts: dict[str, int] = {}
     for r in results:
         cat = r.get("category", "Unknown")
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
-    # Top parent pages with most broken/error links for bar chart
     broken_by_page: dict[str, int] = {}
     for r in results:
         s = str(r["status"])
@@ -480,12 +579,12 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
         "#22c55e","#16a34a","#f59e0b","#ef4444","#dc2626",
         "#3b82f6","#8b5cf6","#64748b","#0ea5e9","#f97316"
     ][:len(cat_counts)])
-    bar_labels = json.dumps([p[:60] + "…" if len(p) > 60 else p for p, _ in top_broken])
-    bar_values = json.dumps([v for _, v in top_broken])
+    bar_labels = json.dumps([p[:60]+"…" if len(p) > 60 else p for p,_ in top_broken])
+    bar_values = json.dumps([v for _,v in top_broken])
 
-    run_time = f"{elapsed:.1f}s"
-    run_date = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    base_url = CONFIG["BASE_URL"]
+    run_date  = now_est().strftime("%Y-%m-%d %H:%M:%S EST")
+    run_dur   = fmt_duration(elapsed)
+    base_url  = CONFIG["BASE_URL"]
 
     def row_class(status):
         s = str(status)
@@ -496,22 +595,29 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
         if s.startswith("5"):  return "servererr"
         return "unkn"
 
-    # Serialise all results as a compact JS array — this is the single
-    # source of truth; the table is rendered from this, never from DOM.
+    def load_display(ms):
+        if ms is None or ms == -1:
+            return "—"
+        if ms < 1000:
+            return f"{ms} ms"
+        return f"{ms/1000:.1f}s"
+
     js_rows = []
     for r in results:
+        lm = r.get("load_ms", -1)
         js_rows.append({
-            "pu":  r["page_url"],               # parent url
-            "lu":  r["link_url"],               # link url
-            "lt":  r.get("link_text","")[:120], # anchor text
-            "tp":  r.get("link_type",""),        # Internal / External
-            "st":  str(r["status"]),            # http status
-            "fu":  r.get("final_url",""),        # final url after redirect
-            "dp":  r.get("depth",""),            # crawl depth
-            "ef":  r.get("effort",""),           # effort level
-            "ca":  r.get("category",""),         # category label
-            "rc":  row_class(r["status"]),       # css row class
-            "ts":  str(r.get("timestamp",""))[:19],
+            "pu": r["page_url"],
+            "lu": r["link_url"],
+            "lt": r.get("link_text","")[:120],
+            "tp": r.get("link_type",""),
+            "st": str(r["status"]),
+            "fu": r.get("final_url",""),
+            "lm": lm if lm is not None else -1,
+            "dp": r.get("depth",""),
+            "ef": r.get("effort",""),
+            "ca": r.get("category",""),
+            "rc": row_class(r["status"]),
+            "ts": str(r.get("timestamp",""))[:22],
         })
     all_data_json = json.dumps(js_rows, ensure_ascii=False)
 
@@ -522,61 +628,69 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Broken Link Report — {base_url}</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
 <style>
-  :root {{
-    --bg:#0f172a; --surface:#1e293b; --surface2:#263348;
-    --border:#334155; --text:#e2e8f0; --muted:#94a3b8;
-    --green:#22c55e; --yellow:#f59e0b; --red:#ef4444;
-    --blue:#3b82f6; --purple:#8b5cf6; --orange:#f97316;
+  :root{{
+    --bg:#0f172a;--surface:#1e293b;--surface2:#263348;
+    --border:#334155;--text:#e2e8f0;--muted:#94a3b8;
+    --green:#22c55e;--yellow:#f59e0b;--red:#ef4444;
+    --blue:#3b82f6;--purple:#8b5cf6;--orange:#f97316;
     --radius:10px;
   }}
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px}}
   a{{color:#60a5fa;text-decoration:none}} a:hover{{text-decoration:underline}}
 
-  .header{{background:var(--surface);border-bottom:1px solid var(--border);padding:18px 28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}}
-  .header h1{{font-size:1.3rem;font-weight:700}} .header h1 span{{color:var(--blue)}}
-  .meta{{color:var(--muted);font-size:12px;display:flex;gap:16px;flex-wrap:wrap}} .meta b{{color:var(--text)}}
-  .hdr-btns{{display:flex;gap:8px}}
+  .header{{background:var(--surface);border-bottom:1px solid var(--border);padding:16px 28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}}
+  .header h1{{font-size:1.25rem;font-weight:700}} .header h1 span{{color:var(--blue)}}
+  .meta{{color:var(--muted);font-size:12px;display:flex;gap:16px;flex-wrap:wrap;margin-top:4px}} .meta b{{color:var(--text)}}
+  .hdr-btns{{display:flex;gap:8px;flex-wrap:wrap}}
 
   .container{{max-width:1600px;margin:0 auto;padding:20px 28px}}
 
-  .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:24px}}
-  .card{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;cursor:pointer;transition:border-color .15s}}
-  .card:hover{{border-color:var(--blue)}}
-  .card.active{{border-color:var(--blue);background:var(--surface2)}}
-  .card .val{{font-size:1.9rem;font-weight:800;line-height:1;margin-bottom:4px}}
+  .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:12px;margin-bottom:22px}}
+  .card{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;cursor:pointer;transition:border-color .15s}}
+  .card:hover{{border-color:var(--blue)}} .card.active{{border-color:var(--blue);background:var(--surface2)}}
+  .card .val{{font-size:1.8rem;font-weight:800;line-height:1;margin-bottom:3px}}
   .card .lbl{{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}}
   .c-green .val{{color:var(--green)}} .c-red .val{{color:var(--red)}}
   .c-yellow .val{{color:var(--yellow)}} .c-blue .val{{color:var(--blue)}}
   .c-orange .val{{color:var(--orange)}} .c-purple .val{{color:var(--purple)}}
   .c-white .val{{color:var(--text)}}
 
-  .charts{{display:grid;grid-template-columns:320px 1fr;gap:18px;margin-bottom:24px}}
+  .charts{{display:grid;grid-template-columns:300px 1fr;gap:16px;margin-bottom:22px}}
   @media(max-width:860px){{.charts{{grid-template-columns:1fr}}}}
-  .chart-box{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px}}
-  .chart-box h2{{font-size:.8rem;font-weight:600;margin-bottom:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}}
-  .chart-box canvas{{max-height:260px}}
+  .chart-box{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px}}
+  .chart-box h2{{font-size:.8rem;font-weight:600;margin-bottom:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}}
+  .chart-box canvas{{max-height:250px}}
 
-  .filters{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;margin-bottom:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}}
+  .filters{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px 16px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}}
   .filters label{{color:var(--muted);font-size:12px;margin-right:3px}}
-  .filters input,.filters select{{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 11px;border-radius:6px;font-size:13px;outline:none}}
-  .filters input{{width:240px}}
+  .filters input,.filters select{{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:13px;outline:none}}
+  .filters input{{width:220px}}
   .filters input:focus,.filters select:focus{{border-color:var(--blue)}}
   .info{{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap}}
 
-  .btn{{background:var(--blue);color:#fff;border:none;padding:7px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}}
+  .export-row{{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center}}
+  .export-row span{{color:var(--muted);font-size:12px}}
+
+  .btn{{background:var(--blue);color:#fff;border:none;padding:7px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;white-space:nowrap}}
   .btn:hover{{background:#2563eb}}
+  .btn-green{{background:#16a34a}} .btn-green:hover{{background:#15803d}}
   .btn-ghost{{background:transparent;border:1px solid var(--border);color:var(--muted)}}
   .btn-ghost:hover{{border-color:var(--blue);color:var(--text)}}
 
   .table-wrap{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:auto}}
   table{{width:100%;border-collapse:collapse}}
-  thead th{{background:var(--surface2);padding:9px 13px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none}}
+  thead th{{background:var(--surface2);padding:9px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none}}
   thead th:hover{{color:var(--text)}}
   tbody tr{{border-bottom:1px solid var(--border)}}
   tbody tr:hover{{background:var(--surface2)}}
-  td{{padding:8px 13px;vertical-align:middle;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+  td{{padding:8px 12px;vertical-align:middle;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+  .td-load{{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px}}
+  .load-slow{{color:#f87171}}
+  .load-med{{color:#fbbf24}}
+  .load-ok{{color:#4ade80}}
 
   .row-redirect{{background:rgba(245,158,11,.04)}}
   .row-broken{{background:rgba(239,68,68,.07)}}
@@ -592,25 +706,24 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
   .p-servererr{{background:rgba(139,92,246,.15);color:#a78bfa}}
   .p-unkn{{background:rgba(148,163,184,.15);color:#94a3b8}}
 
-  .tt{{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600}}
+  .tt{{display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600}}
   .tt-internal{{background:rgba(59,130,246,.15);color:#93c5fd}}
   .tt-external{{background:rgba(139,92,246,.15);color:#c4b5fd}}
   .tt-page{{background:rgba(148,163,184,.15);color:#94a3b8}}
 
-  .bdg{{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600}}
+  .bdg{{display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600}}
   .b-none{{background:rgba(34,197,94,.1);color:#4ade80}}
   .b-low{{background:rgba(245,158,11,.1);color:#fbbf24}}
   .b-lowmed{{background:rgba(249,115,22,.1);color:#fb923c}}
   .b-med{{background:rgba(139,92,246,.1);color:#a78bfa}}
   .b-high{{background:rgba(239,68,68,.15);color:#f87171}}
 
-  .pagination{{display:flex;align-items:center;gap:8px;padding:12px 16px;border-top:1px solid var(--border);flex-wrap:wrap}}
-  .pagination button{{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 12px;border-radius:5px;cursor:pointer;font-size:12px}}
+  .pagination{{display:flex;align-items:center;gap:6px;padding:10px 14px;border-top:1px solid var(--border);flex-wrap:wrap}}
+  .pagination button{{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:5px;cursor:pointer;font-size:12px}}
   .pagination button:hover{{border-color:var(--blue)}}
   .pagination button:disabled{{opacity:.35;cursor:not-allowed}}
   .pagination button.active{{background:var(--blue);border-color:var(--blue);color:#fff}}
-  .pagination .pginfo{{color:var(--muted);font-size:12px;margin:0 6px}}
-
+  .pginfo{{color:var(--muted);font-size:12px;margin:0 4px}}
   .sort-asc::after{{content:" ▲";opacity:.8;font-size:9px}}
   .sort-desc::after{{content:" ▼";opacity:.8;font-size:9px}}
 </style>
@@ -622,44 +735,35 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
     <h1>Broken Link Report — <span>{base_url}</span></h1>
     <div class="meta">
       <span>Run date: <b>{run_date}</b></span>
-      <span>Duration: <b>{run_time}</b></span>
+      <span>Duration: <b>{run_dur}</b></span>
       <span>Depth: <b>{CONFIG["MAX_DEPTH"]}</b></span>
       <span>Workers: <b>{CONFIG["CONCURRENCY"]}</b></span>
     </div>
   </div>
   <div class="hdr-btns">
-    <button class="btn btn-ghost" onclick="exportCSV()">⬇ Export CSV</button>
+    <button class="btn btn-green" onclick="exportExcelFull()">⬇ Full Report Excel</button>
   </div>
 </div>
 
 <div class="container">
 
-  <!-- SUMMARY CARDS — clicking a card filters the table -->
   <div class="cards">
-    <div class="card c-white" onclick="cardFilter('')"         id="card-all">      <div class="val">{total_pages:,}</div><div class="lbl">Parent Pages</div></div>
-    <div class="card c-white" onclick="cardFilter('')"         id="card-links">    <div class="val">{total_links:,}</div><div class="lbl">Total Links</div></div>
-    <div class="card c-green" onclick="cardFilter('ok')"       id="card-ok">       <div class="val">{ok_links:,}</div>  <div class="lbl">200 OK</div></div>
-    <div class="card c-yellow"onclick="cardFilter('redirect')" id="card-redirect"> <div class="val">{redirects:,}</div> <div class="lbl">Redirects (3xx)</div></div>
-    <div class="card c-red"   onclick="cardFilter('broken')"   id="card-broken">   <div class="val">{broken:,}</div>   <div class="lbl">Broken (404/410)</div></div>
-    <div class="card c-purple"onclick="cardFilter('servererr')"id="card-5xx">      <div class="val">{server_errors:,}</div><div class="lbl">Server Errors (5xx)</div></div>
-    <div class="card c-orange"onclick="cardFilter('unkn')"     id="card-err">      <div class="val">{errors:,}</div>   <div class="lbl">Timeout / Error</div></div>
-    <div class="card c-blue"  onclick="typeFilter2('internal')"id="card-int">      <div class="val">{internal:,}</div> <div class="lbl">Internal Links</div></div>
-    <div class="card c-white" onclick="typeFilter2('external')"id="card-ext">      <div class="val">{external:,}</div> <div class="lbl">External Links</div></div>
+    <div class="card c-white"  onclick="cardFilter('')"          id="card-all">     <div class="val">{total_pages:,}</div><div class="lbl">Parent Pages</div></div>
+    <div class="card c-white"  onclick="cardFilter('')"          id="card-links">   <div class="val">{total_links:,}</div><div class="lbl">Total Links</div></div>
+    <div class="card c-green"  onclick="cardFilter('ok')"        id="card-ok">      <div class="val">{ok_links:,}</div>  <div class="lbl">200 OK</div></div>
+    <div class="card c-yellow" onclick="cardFilter('redirect')"  id="card-redirect"><div class="val">{redirects:,}</div> <div class="lbl">Redirects (3xx)</div></div>
+    <div class="card c-red"    onclick="cardFilter('broken')"    id="card-broken">  <div class="val">{broken:,}</div>   <div class="lbl">Broken (404/410)</div></div>
+    <div class="card c-purple" onclick="cardFilter('servererr')" id="card-5xx">     <div class="val">{server_errors:,}</div><div class="lbl">Server Errors (5xx)</div></div>
+    <div class="card c-orange" onclick="cardFilter('unkn')"      id="card-err">     <div class="val">{errors:,}</div>   <div class="lbl">Timeout / Error</div></div>
+    <div class="card c-blue"   onclick="typeFilter2('internal')" id="card-int">     <div class="val">{internal:,}</div> <div class="lbl">Internal Links</div></div>
+    <div class="card c-white"  onclick="typeFilter2('external')" id="card-ext">     <div class="val">{external:,}</div> <div class="lbl">External Links</div></div>
   </div>
 
-  <!-- CHARTS -->
   <div class="charts">
-    <div class="chart-box">
-      <h2>Status Distribution</h2>
-      <canvas id="donut"></canvas>
-    </div>
-    <div class="chart-box">
-      <h2>Top Parent Pages by Broken / Error Links</h2>
-      <canvas id="bar"></canvas>
-    </div>
+    <div class="chart-box"><h2>Status Distribution</h2><canvas id="donut"></canvas></div>
+    <div class="chart-box"><h2>Top Parent Pages by Broken / Error Links</h2><canvas id="bar"></canvas></div>
   </div>
 
-  <!-- FILTERS -->
   <div class="filters">
     <div><label>Search</label>
       <input type="text" id="search" placeholder="Filter by URL or anchor text…" oninput="applyFilters()"></div>
@@ -691,7 +795,12 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
     <span class="info" id="rowInfo"></span>
   </div>
 
-  <!-- TABLE -->
+  <div class="export-row">
+    <span>Export current filter view:</span>
+    <button class="btn btn-green" onclick="exportExcelFiltered()">⬇ Filtered Results Excel</button>
+    <span class="info" id="filteredCount"></span>
+  </div>
+
   <div class="table-wrap">
     <table>
       <thead id="thead">
@@ -704,7 +813,8 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
           <th onclick="sortBy(5)">Category</th>
           <th onclick="sortBy(6)">Depth</th>
           <th onclick="sortBy(7)">Effort</th>
-          <th onclick="sortBy(8)">Timestamp</th>
+          <th onclick="sortBy(8)">Load Time</th>
+          <th onclick="sortBy(9)">Timestamp</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
@@ -714,37 +824,25 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float) -> str
 
 </div>
 
-<!-- ALL DATA — never touched by DOM operations, only read by JS -->
 <script>
-const ALL_DATA = {all_data_json};
+const ALL_DATA  = {all_data_json};
 const PAGE_SIZE = {PAGE_SIZE};
-
-let filtered  = ALL_DATA.slice();
-let sortCol   = -1;
-let sortAsc   = true;
-let curPage   = 0;
+let filtered = ALL_DATA.slice();
+let sortCol  = -1, sortAsc = true, curPage = 0;
 
 // ── CHARTS ──────────────────────────────────────────────────
 new Chart(document.getElementById('donut').getContext('2d'), {{
   type:'doughnut',
-  data:{{
-    labels:{chart_labels},
-    datasets:[{{data:{chart_values},backgroundColor:{chart_colors},borderWidth:2,borderColor:'#1e293b'}}]
-  }},
+  data:{{labels:{chart_labels},datasets:[{{data:{chart_values},backgroundColor:{chart_colors},borderWidth:2,borderColor:'#1e293b'}}]}},
   options:{{responsive:true,plugins:{{
-    legend:{{position:'bottom',labels:{{color:'#94a3b8',padding:12,font:{{size:12}}}}}},
+    legend:{{position:'bottom',labels:{{color:'#94a3b8',padding:10,font:{{size:11}}}}}},
     tooltip:{{callbacks:{{label:ctx=>` ${{ctx.label}}: ${{ctx.parsed.toLocaleString()}}`}}}}
   }}}}
 }});
-
 new Chart(document.getElementById('bar').getContext('2d'), {{
   type:'bar',
-  data:{{
-    labels:{bar_labels},
-    datasets:[{{label:'Broken / Error Links',data:{bar_values},backgroundColor:'rgba(239,68,68,0.7)',borderRadius:4}}]
-  }},
-  options:{{
-    indexAxis:'y',responsive:true,
+  data:{{labels:{bar_labels},datasets:[{{label:'Issues',data:{bar_values},backgroundColor:'rgba(239,68,68,0.7)',borderRadius:3}}]}},
+  options:{{indexAxis:'y',responsive:true,
     plugins:{{legend:{{display:false}},tooltip:{{callbacks:{{label:ctx=>` ${{ctx.parsed.x}} issues`}}}}}},
     scales:{{
       x:{{grid:{{color:'#334155'}},ticks:{{color:'#94a3b8'}}}},
@@ -753,188 +851,202 @@ new Chart(document.getElementById('bar').getContext('2d'), {{
   }}
 }});
 
-// ── PILL / BADGE HELPERS ─────────────────────────────────────
-function statusPill(rc, st) {{
-  return `<span class="pill p-${{rc}}">${{st}}</span>`;
+// ── HELPERS ──────────────────────────────────────────────────
+function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}}
+function short(s,n){{return s.length>n?s.slice(0,n)+'…':s}}
+function loadCell(lm){{
+  if(lm===-1||lm===null)return '<td class="td-load">—</td>';
+  const cls = lm>3000?'load-slow':lm>1000?'load-med':'load-ok';
+  const txt = lm<1000?lm+' ms':(lm/1000).toFixed(1)+'s';
+  return `<td class="td-load ${{cls}}">${{txt}}</td>`;
 }}
-function typeBadge(tp) {{
-  const c = tp.toLowerCase();
-  return `<span class="tt tt-${{c}}">${{tp}}</span>`;
-}}
-function effortBadge(ef) {{
-  const map = {{'None':'b-none','Low':'b-low','Low-Medium':'b-lowmed','Medium':'b-med','High':'b-high'}};
-  return `<span class="bdg ${{map[ef]||'b-med'}}">${{ef}}</span>`;
-}}
-function esc(s) {{
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}}
-function short(s,n) {{
-  return s.length>n ? s.slice(0,n)+'…' : s;
+function statusPill(rc,st){{return `<span class="pill p-${{rc}}">${{st}}</span>`}}
+function typeBadge(tp){{const c=tp.toLowerCase();return `<span class="tt tt-${{c}}">${{tp}}</span>`}}
+function effortBadge(ef){{
+  const m={{'None':'b-none','Low':'b-low','Low-Medium':'b-lowmed','Medium':'b-med','High':'b-high'}};
+  return `<span class="bdg ${{m[ef]||'b-med'}}">${{ef}}</span>`;
 }}
 
 // ── RENDER PAGE ──────────────────────────────────────────────
-// Only PAGE_SIZE <tr> nodes are ever in the DOM at once.
-function renderPage(page) {{
+function renderPage(page){{
   curPage = page;
-  const start = page * PAGE_SIZE;
-  const slice = filtered.slice(start, start + PAGE_SIZE);
-  const tbody = document.getElementById('tbody');
-
-  // Build HTML string then set innerHTML once — single reflow
-  const html = slice.map(r => `
+  const slice = filtered.slice(page*PAGE_SIZE, (page+1)*PAGE_SIZE);
+  document.getElementById('tbody').innerHTML = slice.map(r=>`
     <tr class="row-${{r.rc}}">
-      <td title="${{esc(r.pu)}}"><a href="${{esc(r.pu)}}" target="_blank">${{esc(short(r.pu,70))}}</a></td>
-      <td title="${{esc(r.lu)}}"><a href="${{esc(r.lu)}}" target="_blank">${{esc(short(r.lu,70))}}</a></td>
-      <td title="${{esc(r.lt)}}">${{esc(short(r.lt,50))}}</td>
+      <td title="${{esc(r.pu)}}"><a href="${{esc(r.pu)}}" target="_blank">${{esc(short(r.pu,65))}}</a></td>
+      <td title="${{esc(r.lu)}}"><a href="${{esc(r.lu)}}" target="_blank">${{esc(short(r.lu,65))}}</a></td>
+      <td title="${{esc(r.lt)}}">${{esc(short(r.lt,45))}}</td>
       <td>${{typeBadge(r.tp||'Page')}}</td>
-      <td>${{statusPill(r.rc, r.st)}}</td>
+      <td>${{statusPill(r.rc,r.st)}}</td>
       <td>${{esc(r.ca)}}</td>
       <td>${{esc(r.dp)}}</td>
       <td>${{effortBadge(r.ef)}}</td>
+      ${{loadCell(r.lm)}}
       <td>${{esc(r.ts)}}</td>
     </tr>`).join('');
-  tbody.innerHTML = html;
-
   renderPager();
+  const total = filtered.length;
   document.getElementById('rowInfo').textContent =
-    `${{filtered.length.toLocaleString()}} rows · page ${{page+1}} of ${{Math.max(1,Math.ceil(filtered.length/PAGE_SIZE))}}`;
+    `${{total.toLocaleString()}} rows · page ${{page+1}} of ${{Math.max(1,Math.ceil(total/PAGE_SIZE))}}`;
+  document.getElementById('filteredCount').textContent =
+    `${{total.toLocaleString()}} rows in current filter`;
 }}
 
 // ── PAGINATOR ────────────────────────────────────────────────
-function renderPager() {{
-  const total   = Math.ceil(filtered.length / PAGE_SIZE);
-  const pager   = document.getElementById('pager');
-  if (total <= 1) {{ pager.innerHTML = ''; return; }}
-
-  const maxBtns = 9;
-  let pages = [];
-  if (total <= maxBtns) {{
-    pages = Array.from({{length:total}},(_,i)=>i);
-  }} else {{
-    pages = [0];
-    let lo = Math.max(1, curPage-3), hi = Math.min(total-2, curPage+3);
-    if (lo > 1)       pages.push('…');
-    for (let i=lo;i<=hi;i++) pages.push(i);
-    if (hi < total-2) pages.push('…');
+function renderPager(){{
+  const total=Math.ceil(filtered.length/PAGE_SIZE);
+  const pager=document.getElementById('pager');
+  if(total<=1){{pager.innerHTML='';return;}}
+  let pages=[];
+  if(total<=9){{pages=Array.from({{length:total}},(_,i)=>i);}}
+  else{{
+    pages=[0];
+    let lo=Math.max(1,curPage-3),hi=Math.min(total-2,curPage+3);
+    if(lo>1)pages.push('…');
+    for(let i=lo;i<=hi;i++)pages.push(i);
+    if(hi<total-2)pages.push('…');
     pages.push(total-1);
   }}
-
-  pager.innerHTML =
-    `<button onclick="renderPage(${{curPage-1}})" ${{curPage===0?'disabled':''}}>‹ Prev</button>` +
-    pages.map(p => p==='…'
-      ? `<span class="pginfo">…</span>`
-      : `<button class="${{p===curPage?'active':''}}" onclick="renderPage(${{p}})">${{p+1}}</button>`
-    ).join('') +
+  pager.innerHTML=
+    `<button onclick="renderPage(${{curPage-1}})" ${{curPage===0?'disabled':''}}>‹ Prev</button>`+
+    pages.map(p=>p==='…'?`<span class="pginfo">…</span>`:
+      `<button class="${{p===curPage?'active':''}}" onclick="renderPage(${{p}})">${{p+1}}</button>`
+    ).join('')+
     `<button onclick="renderPage(${{curPage+1}})" ${{curPage>=total-1?'disabled':''}}>Next ›</button>`;
 }}
 
 // ── FILTER ───────────────────────────────────────────────────
-let searchTimer = null;
-
-function applyFilters() {{
-  clearTimeout(searchTimer);
-  searchTimer = setTimeout(_applyFilters, 120);  // debounce search input
-}}
-
-function _applyFilters() {{
-  const q  = document.getElementById('search').value.toLowerCase().trim();
-  const st = document.getElementById('statusFilter').value;
-  const tp = document.getElementById('typeFilter').value;
-  const ef = document.getElementById('effortFilter').value;
-
-  filtered = ALL_DATA.filter(r => {{
-    if (st && r.rc  !== st)  return false;
-    if (tp && r.tp  !== tp)  return false;
-    if (ef && r.ef  !== ef)  return false;
-    if (q  && !( r.pu.toLowerCase().includes(q) ||
-                 r.lu.toLowerCase().includes(q) ||
-                 r.lt.toLowerCase().includes(q) )) return false;
+let _searchTimer=null;
+function applyFilters(){{clearTimeout(_searchTimer);_searchTimer=setTimeout(_applyFilters,120);}}
+function _applyFilters(){{
+  const q=document.getElementById('search').value.toLowerCase().trim();
+  const st=document.getElementById('statusFilter').value;
+  const tp=document.getElementById('typeFilter').value;
+  const ef=document.getElementById('effortFilter').value;
+  filtered=ALL_DATA.filter(r=>{{
+    if(st&&r.rc!==st)return false;
+    if(tp&&r.tp!==tp)return false;
+    if(ef&&r.ef!==ef)return false;
+    if(q&&!(r.pu.toLowerCase().includes(q)||r.lu.toLowerCase().includes(q)||r.lt.toLowerCase().includes(q)))return false;
     return true;
   }});
-
-  if (sortCol >= 0) sortFiltered();
+  if(sortCol>=0)sortFiltered();
   renderPage(0);
   updateCardHighlight();
 }}
-
-function resetFilters() {{
-  document.getElementById('search').value   = '';
-  document.getElementById('statusFilter').value = '';
-  document.getElementById('typeFilter').value   = '';
-  document.getElementById('effortFilter').value  = '';
-  filtered  = ALL_DATA.slice();
-  sortCol   = -1;
-  sortAsc   = true;
-  document.querySelectorAll('#thead th').forEach(th=>{{
-    th.classList.remove('sort-asc','sort-desc');
-  }});
+function resetFilters(){{
+  document.getElementById('search').value='';
+  document.getElementById('statusFilter').value='';
+  document.getElementById('typeFilter').value='';
+  document.getElementById('effortFilter').value='';
+  filtered=ALL_DATA.slice();sortCol=-1;sortAsc=true;
+  document.querySelectorAll('#thead th').forEach(th=>th.classList.remove('sort-asc','sort-desc'));
   document.querySelectorAll('.card').forEach(c=>c.classList.remove('active'));
   renderPage(0);
 }}
-
-// ── CARD QUICK FILTERS ───────────────────────────────────────
-function cardFilter(rc) {{
-  document.getElementById('statusFilter').value = rc;
-  document.getElementById('typeFilter').value   = '';
-  document.getElementById('effortFilter').value  = '';
-  document.getElementById('search').value        = '';
+function cardFilter(rc){{
+  document.getElementById('statusFilter').value=rc;
+  document.getElementById('typeFilter').value='';
+  document.getElementById('effortFilter').value='';
+  document.getElementById('search').value='';
   _applyFilters();
 }}
-function typeFilter2(tp) {{
-  document.getElementById('typeFilter').value   = tp.charAt(0).toUpperCase()+tp.slice(1);
-  document.getElementById('statusFilter').value = '';
-  document.getElementById('effortFilter').value  = '';
-  document.getElementById('search').value        = '';
+function typeFilter2(tp){{
+  document.getElementById('typeFilter').value=tp.charAt(0).toUpperCase()+tp.slice(1);
+  document.getElementById('statusFilter').value='';
+  document.getElementById('effortFilter').value='';
+  document.getElementById('search').value='';
   _applyFilters();
 }}
-function updateCardHighlight() {{
-  const st = document.getElementById('statusFilter').value;
-  const tp = document.getElementById('typeFilter').value.toLowerCase();
+function updateCardHighlight(){{
+  const st=document.getElementById('statusFilter').value;
+  const tp=document.getElementById('typeFilter').value.toLowerCase();
   document.querySelectorAll('.card').forEach(c=>c.classList.remove('active'));
-  const map = {{'ok':'card-ok','redirect':'card-redirect','broken':'card-broken',
-                'servererr':'card-5xx','unkn':'card-err'}};
-  if (map[st])          document.getElementById(map[st])?.classList.add('active');
-  if (tp==='internal')  document.getElementById('card-int')?.classList.add('active');
-  if (tp==='external')  document.getElementById('card-ext')?.classList.add('active');
+  const m={{'ok':'card-ok','redirect':'card-redirect','broken':'card-broken','servererr':'card-5xx','unkn':'card-err'}};
+  if(m[st])document.getElementById(m[st])?.classList.add('active');
+  if(tp==='internal')document.getElementById('card-int')?.classList.add('active');
+  if(tp==='external')document.getElementById('card-ext')?.classList.add('active');
 }}
 
 // ── SORT ─────────────────────────────────────────────────────
-const SORT_KEYS = ['pu','lu','lt','tp','st','ca','dp','ef','ts'];
-
-function sortBy(col) {{
-  if (sortCol === col) {{ sortAsc = !sortAsc; }}
-  else {{ sortCol = col; sortAsc = true; }}
-  document.querySelectorAll('#thead th').forEach((th,i) => {{
+const SORT_KEYS=['pu','lu','lt','tp','st','ca','dp','ef','lm','ts'];
+function sortBy(col){{
+  if(sortCol===col){{sortAsc=!sortAsc;}}else{{sortCol=col;sortAsc=true;}}
+  document.querySelectorAll('#thead th').forEach((th,i)=>{{
     th.classList.remove('sort-asc','sort-desc');
-    if (i===col) th.classList.add(sortAsc?'sort-asc':'sort-desc');
+    if(i===col)th.classList.add(sortAsc?'sort-asc':'sort-desc');
   }});
-  sortFiltered();
-  renderPage(0);
+  sortFiltered();renderPage(0);
+}}
+function sortFiltered(){{
+  const key=SORT_KEYS[sortCol];
+  filtered.sort((a,b)=>{{
+    const va=String(a[key]??''),vb=String(b[key]??'');
+    const n=Number(va)-Number(vb);
+    const cmp=isNaN(n)?va.localeCompare(vb):n;
+    return sortAsc?cmp:-cmp;
+  }});
 }}
 
-function sortFiltered() {{
-  const key = SORT_KEYS[sortCol];
-  filtered.sort((a,b) => {{
-    const va = String(a[key]??''), vb = String(b[key]??'');
-    const n  = Number(va) - Number(vb);
-    const cmp = isNaN(n) ? va.localeCompare(vb) : n;
-    return sortAsc ? cmp : -cmp;
-  }});
+// ── EXCEL EXPORT (SheetJS) ───────────────────────────────────
+const XL_HEADERS = ['Parent URL','Link URL','Anchor Text','Type','Status',
+                    'Category','Depth','Effort','Load Time (ms)','Timestamp'];
+const XL_KEYS    = ['pu','lu','lt','tp','st','ca','dp','ef','lm','ts'];
+
+function rowsToSheet(data){{
+  const ws_data = [XL_HEADERS, ...data.map(r=>XL_KEYS.map(k=>{{
+    const v=r[k]??'';
+    // Load time: store as number, -1 becomes blank
+    if(k==='lm') return v===-1?'':Number(v);
+    // Depth: numeric
+    if(k==='dp') return v===''?'':Number(v)||v;
+    return String(v);
+  }}))];
+  const ws = XLSX.utils.aoa_to_sheet(ws_data);
+  // Column widths
+  ws['!cols']=[{{wch:60}},{{wch:60}},{{wch:35}},{{wch:10}},{{wch:12}},
+               {{wch:18}},{{wch:7}},{{wch:12}},{{wch:14}},{{wch:24}}];
+  return ws;
 }}
 
-// ── CSV EXPORT (exports filtered data, not just current page) ─
-function exportCSV() {{
-  const headers = ['Parent URL','Link URL','Anchor Text','Type','Status',
-                   'Category','Depth','Effort','Timestamp'];
-  const keys    = ['pu','lu','lt','tp','st','ca','dp','ef','ts'];
-  const lines   = [headers.join(',')];
-  filtered.forEach(r => {{
-    lines.push(keys.map(k => '"' + String(r[k]??'').replace(/"/g,'""') + '"').join(','));
-  }});
-  const blob = new Blob([lines.join('\\n')], {{type:'text/csv'}});
-  const a = Object.assign(document.createElement('a'),
-    {{href:URL.createObjectURL(blob), download:'broken_links_filtered.csv'}});
-  a.click();
+function buildWorkbook(data, sheetName){{
+  const wb = XLSX.utils.book_new();
+  const ws = rowsToSheet(data);
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
+
+  // Summary sheet
+  const now_str = new Date().toLocaleString('en-US',{{timeZone:'America/New_York'}});
+  const summary = [
+    ['Broken Link Report'],
+    ['Site', '{base_url}'],
+    ['Run Date (EST)', '{run_date}'],
+    ['Duration', '{run_dur}'],
+    [''],
+    ['Metric','Count'],
+    ['Parent Pages', {total_pages}],
+    ['Total Links', {total_links}],
+    ['200 OK', {ok_links}],
+    ['Redirects (3xx)', {redirects}],
+    ['Broken (404/410)', {broken}],
+    ['Server Errors (5xx)', {server_errors}],
+    ['Timeout / Error', {errors}],
+    ['Internal Links', {internal}],
+    ['External Links', {external}],
+  ];
+  const ws2 = XLSX.utils.aoa_to_sheet(summary);
+  ws2['!cols']=[{{wch:24}},{{wch:40}}];
+  XLSX.utils.book_append_sheet(wb, ws2, 'Summary');
+  return wb;
+}}
+
+function exportExcelFull(){{
+  const wb = buildWorkbook(ALL_DATA, 'All Links');
+  XLSX.writeFile(wb, 'broken_links_full_report.xlsx');
+}}
+
+function exportExcelFiltered(){{
+  const wb = buildWorkbook(filtered, 'Filtered Results');
+  XLSX.writeFile(wb, 'broken_links_filtered.xlsx');
 }}
 
 // ── INIT ─────────────────────────────────────────────────────
@@ -944,10 +1056,132 @@ renderPage(0);
 </html>"""
     return html
 
+# ──────────────────────────────────────────────
+#  EXCEL OUTPUT  (openpyxl)
+# ──────────────────────────────────────────────
 
-# ──────────────────────────────────────────────
-#  ENTRY POINT
-# ──────────────────────────────────────────────
+def write_excel(results: list[dict], path: str):
+    """Write a formatted .xlsx file with two sheets: All Links + Summary."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        log.warning("openpyxl not installed — skipping Excel output")
+        return
+
+    STATUS_FILLS = {
+        "ok":        PatternFill("solid", fgColor="D4EDDA"),
+        "redirect":  PatternFill("solid", fgColor="FFF3CD"),
+        "broken":    PatternFill("solid", fgColor="F8D7DA"),
+        "warn":      PatternFill("solid", fgColor="FFE5CC"),
+        "servererr": PatternFill("solid", fgColor="E2D9F3"),
+        "unkn":      PatternFill("solid", fgColor="E9ECEF"),
+    }
+    HDR_FILL  = PatternFill("solid", fgColor="1F4E79")
+    HDR_FONT  = Font(bold=True, color="FFFFFF", size=11)
+    BOLD      = Font(bold=True)
+    thin      = Side(border_style="thin", color="CCCCCC")
+    BORDER    = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def rc(status):
+        s = str(status)
+        if s == "200":         return "ok"
+        if s.startswith("3"):  return "redirect"
+        if s in ("404","410"): return "broken"
+        if s.startswith("4"):  return "warn"
+        if s.startswith("5"):  return "servererr"
+        return "unkn"
+
+    wb = openpyxl.Workbook()
+
+    # ── Sheet 1: All Links ────────────────────────────────────
+    ws = wb.active
+    ws.title = "All Links"
+    headers = ["Parent URL","Link URL","Anchor Text","Type","Status",
+               "Category","Depth","Effort","Load Time (ms)","Timestamp"]
+    col_widths = [70, 70, 35, 12, 12, 18, 8, 14, 16, 24]
+
+    for ci, (h, w) in enumerate(zip(headers, col_widths), 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font      = HDR_FONT
+        cell.fill      = HDR_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border    = BORDER
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.row_dimensions[1].height = 18
+    ws.freeze_panes = "A2"
+
+    for ri, r in enumerate(results, 2):
+        lm = r.get("load_ms", -1)
+        load_val = lm if lm not in (None, -1) else None
+        row_vals = [
+            r.get("page_url",""), r.get("link_url",""),
+            r.get("link_text",""), r.get("link_type",""),
+            str(r.get("status","")), r.get("category",""),
+            r.get("depth",""), r.get("effort",""),
+            load_val, str(r.get("timestamp",""))
+        ]
+        fill = STATUS_FILLS.get(rc(r.get("status","")))
+        for ci, val in enumerate(row_vals, 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.border    = BORDER
+            cell.alignment = Alignment(vertical="center",
+                                       wrap_text=(ci in (1,2)))
+            if fill:
+                cell.fill = fill
+
+    ws.auto_filter.ref = ws.dimensions
+
+    # ── Sheet 2: Summary ─────────────────────────────────────
+    ws2 = wb.create_sheet("Summary")
+    broken = sum(1 for r in results if str(r.get("status","")) in ("404","410","451"))
+    ok     = sum(1 for r in results if str(r.get("status","")) == "200")
+    redirects = sum(1 for r in results if str(r.get("status","")).startswith("3"))
+    server_errors = sum(1 for r in results if str(r.get("status","")).startswith("5"))
+    errors = sum(1 for r in results if "Error" in str(r.get("status","")) or "Timeout" in str(r.get("status","")))
+    internal = sum(1 for r in results if r.get("link_type") == "Internal")
+    external = sum(1 for r in results if r.get("link_type") == "External")
+    pages    = len({r["page_url"] for r in results})
+
+    summary_rows = [
+        ("Broken Link Report", None),
+        ("Site", CONFIG["BASE_URL"]),
+        ("Run Date (EST)", now_est().strftime("%Y-%m-%d %H:%M:%S EST")),
+        (None, None),
+        ("Metric", "Count"),
+        ("Parent Pages Crawled", pages),
+        ("Total Links Found", len(results)),
+        ("200 OK", ok),
+        ("Redirects (3xx)", redirects),
+        ("Broken (404/410)", broken),
+        ("Server Errors (5xx)", server_errors),
+        ("Timeout / Errors", errors),
+        ("Internal Links", internal),
+        ("External Links", external),
+    ]
+    ws2.column_dimensions["A"].width = 28
+    ws2.column_dimensions["B"].width = 45
+    for ri2, (label, value) in enumerate(summary_rows, 1):
+        if label:
+            c = ws2.cell(row=ri2, column=1, value=label)
+            if ri2 == 1:
+                c.font = Font(bold=True, size=14, color="1F4E79")
+            elif label == "Metric":
+                c.font = HDR_FONT
+                c.fill = HDR_FILL
+                vc = ws2.cell(row=ri2, column=2, value=value)
+                vc.font = HDR_FONT
+                vc.fill = HDR_FILL
+                continue
+            else:
+                c.font = BOLD
+        if value is not None:
+            ws2.cell(row=ri2, column=2, value=value)
+
+    wb.save(path)
+    log.info("Excel written → %s  (%d rows)", path, len(results))
+
 
 async def main():
     start_time = time.time()
@@ -962,53 +1196,58 @@ async def main():
         log.warning("No results collected. Check BASE_URL and network access.")
         return
 
-    elapsed = time.time() - start_time
+    elapsed  = time.time() - start_time
+    dur_str  = fmt_duration(elapsed)
+    run_date = now_est().strftime("%Y-%m-%d %H:%M:%S EST")
+    ts_tag   = now_est().strftime("%Y%m%d_%H%M%S")
 
     output_dir = Path(CONFIG["OUTPUT_DIR"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ts_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    csv_path  = str(output_dir / f"broken_links_{ts_tag}.csv")
-    html_path = str(output_dir / f"report_{ts_tag}.html")
+    csv_path   = str(output_dir / f"broken_links_{ts_tag}.csv")
+    html_path  = str(output_dir / f"report_{ts_tag}.html")
+    xlsx_path  = str(output_dir / f"broken_links_{ts_tag}.xlsx")
 
     write_csv(results, csv_path)
+    write_excel(results, xlsx_path)
 
     html = build_html_report(results, csv_path, elapsed)
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
     log.info("HTML report written → %s", html_path)
 
-    # Also write index.html — GitHub Pages always serves this as the latest report
+    # index.html — GitHub Pages serves this as the live report URL
     index_path = str(output_dir / "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
         f.write(html)
     log.info("index.html written → %s (used by GitHub Pages)", index_path)
 
-    # Summary to stdout (picked up by GitHub Actions step summary)
     broken = sum(1 for r in results if str(r["status"]) in ("404","410","451"))
     ok     = sum(1 for r in results if str(r["status"]) == "200")
     print(f"\n{'─'*60}")
     print(f"  CRAWL SUMMARY")
     print(f"  Base URL   : {CONFIG['BASE_URL']}")
+    print(f"  Run Date   : {run_date}")
     print(f"  Pages      : {len({r['page_url'] for r in results}):,}")
     print(f"  Total links: {len(results):,}")
     print(f"  200 OK     : {ok:,}")
-    print(f"  Broken (404/410): {broken:,}")
-    print(f"  Duration   : {elapsed:.1f}s")
+    print(f"  Broken     : {broken:,}")
+    print(f"  Duration   : {dur_str}")
     print(f"  Reports    : {csv_path}")
     print(f"              {html_path}")
+    print(f"              {xlsx_path}")
     print(f"{'─'*60}\n")
 
-    # GitHub Actions step summary
     if os.getenv("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
             f.write(f"## Crawl Results for `{CONFIG['BASE_URL']}`\n\n")
             f.write(f"| Metric | Value |\n|---|---|\n")
-            f.write(f"| Pages Crawled | {len({r['page_url'] for r in results}):,} |\n")
+            f.write(f"| Run Date (EST) | {run_date} |\n")
+            f.write(f"| Pages Crawled | {len({r["page_url"] for r in results}):,} |\n")
             f.write(f"| Total Links | {len(results):,} |\n")
             f.write(f"| 200 OK | {ok:,} |\n")
             f.write(f"| Broken (404/410) | {broken:,} |\n")
-            f.write(f"| Duration | {elapsed:.1f}s |\n")
+            f.write(f"| Duration | {dur_str} |\n")
 
 
 if __name__ == "__main__":
