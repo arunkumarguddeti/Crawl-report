@@ -22,18 +22,34 @@ on:
   schedule:
     - cron: '0 8 * * 1'
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
 jobs:
   crawl:
     name: Run Crawler
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -56,9 +72,18 @@ jobs:
         run: |
           python crawler.py
 
-      - name: Upload report artifact
+      - name: Verify reports folder
+        run: |
+          echo "=== Files in reports/ ==="
+          ls -lh reports/
+          echo "=== Checking index.html exists ==="
+          test -f reports/index.html && echo "✅ index.html found" || echo "❌ index.html MISSING"
+
+      - name: Upload ZIP artifact (download from Actions tab)
         uses: actions/upload-artifact@v4
         if: always()
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           name: broken-link-report-${{ github.run_number }}
           path: |
@@ -66,8 +91,22 @@ jobs:
             reports/*.csv
           retention-days: 30
 
-      - name: Print summary
+      - name: Upload report to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./reports
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Write job summary
         if: always()
         run: |
-          echo "## Reports Generated" >> $GITHUB_STEP_SUMMARY
-          ls -lh reports/ >> $GITHUB_STEP_SUMMARY || echo "No reports directory found."
+          echo "## ✅ Crawl Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Live report URL:** ${{ steps.deployment.outputs.page_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          ls -lh reports/ | awk 'NR>1 {print "| " $9 " | " $5 " |"}' >> $GITHUB_STEP_SUMMARY || true
