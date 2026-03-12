@@ -689,7 +689,14 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
 
     run_date   = now_est().strftime("%Y-%m-%d %H:%M:%S EST")
     run_dur    = fmt_duration(elapsed)
-    base_url   = CONFIG["BASE_URL"]
+    # In targeted mode, derive display URL from first target page if BASE_URL is still default
+    _default_url = "https://www.example.com"
+    if scan_mode == "targeted" and target_pages and CONFIG["BASE_URL"].rstrip("/") == _default_url.rstrip("/"):
+        from urllib.parse import urlparse as _up
+        _p = _up(target_pages[0])
+        base_url = f"{_p.scheme}://{_p.netloc}"
+    else:
+        base_url = CONFIG["BASE_URL"]
     scan_label = CONFIG.get("SCAN_LABEL", "")
     mode_badge = (
         f'<span style="background:#7c3aed;color:#fff;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700;margin-left:10px">🎯 TARGETED SCAN</span>'
@@ -875,7 +882,8 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
     </div>
   </div>
   <div class="hdr-btns">
-    <button class="btn btn-green" onclick="exportExcelFull()">⬇ Full Report Excel</button>
+    <button class="btn btn-green" onclick="exportExcelFull()">⬇ Full Excel</button>
+    <button class="btn" onclick="exportCsvFull()">⬇ Full CSV</button>
   </div>
 </div>
 
@@ -932,7 +940,8 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
 
   <div class="export-row">
     <span>Export current filter view:</span>
-    <button class="btn btn-green" onclick="exportExcelFiltered()">⬇ Filtered Results Excel</button>
+    <button class="btn btn-green" onclick="exportExcelFiltered()">⬇ Filtered Excel</button>
+    <button class="btn" onclick="exportCsvFiltered()">⬇ Filtered CSV</button>
     <span class="info" id="filteredCount"></span>
   </div>
 
@@ -1182,6 +1191,42 @@ function exportExcelFull(){{
 function exportExcelFiltered(){{
   const wb = buildWorkbook(filtered, 'Filtered Results');
   XLSX.writeFile(wb, 'broken_links_filtered.xlsx');
+}}
+
+// ── CSV EXPORT ───────────────────────────────────────────────
+function rowsToCsv(data){{
+  const headers = ['Parent URL','Link URL','Anchor Text','Type','Status',
+                   'Category','Depth','Effort','Load Time (ms)','Timestamp'];
+  const keys    = ['pu','lu','lt','tp','st','ca','dp','ef','lm','ts'];
+  const escape  = v => {{
+    const s = v===null||v===undefined?'':String(v);
+    return s.includes(',') || s.includes('"') || s.includes('\n')
+      ? '"' + s.replace(/"/g,'""') + '"' : s;
+  }};
+  const rows = [headers.join(',')];
+  data.forEach(r => {{
+    rows.push(keys.map(k => {{
+      const v = r[k]??'';
+      return escape(k==='lm'&&v===-1?'':v);
+    }}).join(','));
+  }});
+  return rows.join('\n');
+}}
+
+function downloadCsv(content, filename){{
+  const blob = new Blob(['\uFEFF' + content], {{type:'text/csv;charset=utf-8;'}});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}}
+
+function exportCsvFull(){{
+  downloadCsv(rowsToCsv(ALL_DATA), 'broken_links_full_report.csv');
+}}
+
+function exportCsvFiltered(){{
+  downloadCsv(rowsToCsv(filtered), 'broken_links_filtered.csv');
 }}
 
 // ── INIT ─────────────────────────────────────────────────────

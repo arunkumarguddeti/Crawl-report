@@ -1,15 +1,15 @@
+# ─────────────────────────────────────────────────────────────
+#  crawl.yml — Site 1
+#  Handles EST (UTC-5) AND EDT (UTC-4) automatically.
+#  Dedup cache prevents double-run on DST transition days.
+# ─────────────────────────────────────────────────────────────
 name: Broken Link Crawler
 
 on:
   workflow_dispatch:
     inputs:
-      base_url:
-        description: 'Website base URL (used for full crawl and domain matching)'
-        required: true
-        default: 'https://www.example.com'
-
       scan_mode:
-        description: 'Scan mode'
+        description: 'Scan mode — choose FIRST, then fill the fields below accordingly'
         required: true
         default: 'full'
         type: choice
@@ -17,17 +17,22 @@ on:
           - full
           - targeted
 
+      base_url:
+        description: |
+          [FULL MODE] Website to crawl from root.
+          [TARGETED MODE] Site root — used for Internal vs External classification.
+        required: true
+        default: 'https://www.example.com'
+
       target_pages:
         description: |
-          [TARGETED MODE ONLY] Comma-separated page URLs to scan.
-          Example: https://site.com/about,https://site.com/contact,https://site.com/services
+          [TARGETED MODE ONLY] Comma-separated URLs to scan.
+          Example: https://site.com/about,https://site.com/contact
         required: false
         default: ''
 
       scan_label:
-        description: |
-          Optional label to identify this run (e.g. "Homepage fix" or "Sprint-42 audit").
-          Shown in the report header and included in the artifact filename.
+        description: 'Optional label shown in report (e.g. "Sprint-42")'
         required: false
         default: ''
 
@@ -37,21 +42,26 @@ on:
         default: '8'
 
       max_pages:
-        description: '[FULL MODE] Hard cap on pages to crawl'
+        description: '[FULL MODE] Max pages to crawl'
         required: false
         default: '3000'
 
       concurrency:
-        description: 'Parallel workers (default: 10)'
+        description: 'Parallel workers'
         required: false
         default: '10'
 
   schedule:
-    - cron: '0 9 * * *'   # Everyday 6:00 AM EST (9:00 UTC)
-    - cron: '0 23 * * *' # Everyday 8:00 PM EST (23:00 UTC)
+    #  EST (UTC-5):  6 AM = 11:00 UTC  |  8 PM = 01:00 UTC
+    #  EDT (UTC-4):  6 AM = 10:00 UTC  |  8 PM = 00:00 UTC
+    #  All 4 crons run, but the dedup step below prevents double-execution.
+    - cron: '0 11 * * *'   # 6 AM EST
+    - cron: '0 10 * * *'   # 6 AM EDT
+    - cron: '0 1  * * *'   # 8 PM EST
+    - cron: '0 0  * * *'   # 8 PM EDT
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -61,7 +71,7 @@ concurrency:
 
 jobs:
   crawl:
-    name: Run Crawler (${{ github.event.inputs.scan_mode || 'scheduled-full' }})
+    name: Crawl (${{ github.event.inputs.scan_mode || 'scheduled-full' }})
     runs-on: ubuntu-latest
     timeout-minutes: 360
     environment:
@@ -73,6 +83,41 @@ jobs:
         uses: actions/checkout@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      # ── DST dedup: skip if we already ran in the last 8 hours ──────────
+      # Cache key = site1 + date + AM or PM slot.
+      # If the cache already exists this slot was already covered → exit 0.
+      - name: Check dedup slot
+        id: dedup
+        if: github.event_name == 'schedule'
+        run: |
+          # Determine which 8-hour slot we're in: 00-08 UTC (night), 08-16 UTC (day), 16-24 UTC (evening)
+          HOUR=$(date -u +%H)
+          DATE=$(TZ=America/New_York date +%Y-%m-%d)
+          if   [ "$HOUR" -ge 8  ] && [ "$HOUR" -lt 16 ]; then SLOT="morning"
+          elif [ "$HOUR" -ge 16 ] || [ "$HOUR" -lt 8  ]; then SLOT="evening"
+          else SLOT="night"
+          fi
+          echo "slot_key=site1-${DATE}-${SLOT}" >> $GITHUB_OUTPUT
+          echo "Slot key: site1-${DATE}-${SLOT}"
+
+      - name: Restore dedup cache
+        id: cache
+        if: github.event_name == 'schedule'
+        uses: actions/cache@v4
+        with:
+          path: .dedup
+          key: ${{ steps.dedup.outputs.slot_key }}
+
+      - name: Skip if already ran this slot
+        if: github.event_name == 'schedule' && steps.cache.outputs.cache-hit == 'true'
+        run: |
+          echo "✅ Already ran in this slot — skipping duplicate DST trigger."
+          exit 0
+
+      - name: Mark slot as used
+        if: github.event_name == 'schedule'
+        run: mkdir -p .dedup && echo "done" > .dedup/ran
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -87,41 +132,78 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── Validate targeted mode has pages supplied ──────────────
       - name: Validate inputs
         run: |
           MODE="${{ github.event.inputs.scan_mode }}"
           PAGES="${{ github.event.inputs.target_pages }}"
           if [ "$MODE" = "targeted" ] && [ -z "$PAGES" ]; then
-            echo "❌ ERROR: scan_mode is 'targeted' but target_pages is empty."
-            echo "Please provide at least one URL in the target_pages field."
+            echo "❌ scan_mode is 'targeted' but target_pages is empty."
             exit 1
           fi
-          echo "✅ Inputs valid. Mode: $MODE"
+          echo "✅ Mode: ${MODE:-scheduled-full}"
 
       - name: Run crawler
         env:
-          BASE_URL:      ${{ github.event.inputs.base_url || 'https://www.example.com' }}
-          # TARGET_PAGES is empty string for full mode — crawler ignores it
-          TARGET_PAGES:  ${{ github.event.inputs.target_pages || '' }}
-          SCAN_LABEL:    ${{ github.event.inputs.scan_label || '' }}
-          MAX_DEPTH:     ${{ github.event.inputs.max_depth || '8' }}
-          MAX_PAGES:     ${{ github.event.inputs.max_pages || '3000' }}
-          CONCURRENCY:   ${{ github.event.inputs.concurrency || '10' }}
-          TIMEOUT:       '10'
-          POLITE_DELAY:  '0.3'
+          BASE_URL:       ${{ github.event.inputs.base_url || secrets.BASE_URL_SITE1 || 'https://www.example.com' }}
+          TARGET_PAGES:   ${{ github.event.inputs.target_pages || '' }}
+          SCAN_LABEL:     ${{ github.event.inputs.scan_label || '' }}
+          MAX_DEPTH:      ${{ github.event.inputs.max_depth || '8' }}
+          MAX_PAGES:      ${{ github.event.inputs.max_pages || '3000' }}
+          CONCURRENCY:    ${{ github.event.inputs.concurrency || '10' }}
+          TIMEOUT:        '10'
+          POLITE_DELAY:   '0.3'
           RESPECT_ROBOTS: 'true'
-          OUTPUT_DIR:    './reports'
-        run: |
-          python crawler.py
+          OUTPUT_DIR:     './reports'
+        run: python crawler.py
 
-      - name: Verify reports folder
+      - name: Verify reports
         run: |
-          echo "=== Files in reports/ ==="
           ls -lh reports/
-          test -f reports/index.html && echo "✅ index.html found" || echo "❌ index.html MISSING"
+          test -f reports/index.html && echo "✅ index.html found" || (echo "❌ Missing" && exit 1)
 
-      # Artifact name includes the label so multiple same-day runs are distinct
+      # ── Archive to gh-pages branch ─────────────────────────────────────
+      - name: Archive report to gh-pages
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages 2>/dev/null || true
+          git worktree add /tmp/gh-pages origin/gh-pages 2>/dev/null || \
+            (git worktree add --orphan -b gh-pages /tmp/gh-pages && echo "Created gh-pages")
+          mkdir -p /tmp/gh-pages/archive/site1
+          cp reports/*.html /tmp/gh-pages/archive/site1/ 2>/dev/null || true
+          cp reports/*.csv  /tmp/gh-pages/archive/site1/ 2>/dev/null || true
+          cp reports/*.xlsx /tmp/gh-pages/archive/site1/ 2>/dev/null || true
+          find /tmp/gh-pages/archive/site1 -type f -mtime +60 -delete 2>/dev/null || true
+          cd /tmp/gh-pages
+          python3 - << 'PYEOF'
+          import re
+          from pathlib import Path
+          files = sorted(Path("archive/site1").glob("report_*.html"), reverse=True)
+          rows = ""
+          for f in files[:50]:
+              name = f.name
+              m = re.search(r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", name)
+              label = f"{m.group(1)}-{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}:{m.group(6)} EST" if m else name
+              rows += f'<tr><td><a href="site1/{name}">{label}</a></td><td>{name}</td></tr>\n'
+          html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+          <title>Site 1 Archive</title>
+          <style>body{{font-family:sans-serif;background:#0f172a;color:#e2e8f0;padding:30px}}
+          a{{color:#60a5fa}}table{{width:100%;border-collapse:collapse;margin-top:20px}}
+          th,td{{padding:10px 14px;border:1px solid #334155}}th{{background:#1e293b}}
+          tr:hover{{background:#1e293b}}</style></head>
+          <body><h1>📂 Site 1 Report Archive</h1>
+          <p>{len(files)} reports · files auto-deleted after 60 days</p>
+          <table><thead><tr><th>Run Date (EST)</th><th>File</th></tr></thead>
+          <tbody>{rows}</tbody></table></body></html>"""
+          Path("archive/site1/index.html").write_text(html)
+          print(f"Archive: {len(files)} reports")
+          PYEOF
+          git add -A
+          git diff --cached --quiet || git commit -m "Archive site1 $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push origin gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
         if: always()
@@ -144,11 +226,61 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
+      # ── Email — Option A: Gmail App Password (personal accounts) ────────
+      # Requires secrets: MAIL_USERNAME, MAIL_PASSWORD (App Password), MAIL_TO
+      # Get App Password: myaccount.google.com → Security → App passwords
+      - name: Send email (Gmail App Password)
+        if: ${{ always() && secrets.MAIL_PASSWORD != '' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.MAIL_TO }}
+          from: Crawl Reports <${{ secrets.MAIL_USERNAME }}>
+          subject: "🔗 Broken Link Report — ${{ github.event.inputs.base_url || 'Scheduled' }} — Run #${{ github.run_number }}"
+          convert_markdown: true
+          body: |
+            ## Broken Link Report Complete
+
+            **Site:** ${{ github.event.inputs.base_url || 'Scheduled run' }}
+            **Mode:** ${{ github.event.inputs.scan_mode || 'full (scheduled)' }}
+            **Label:** ${{ github.event.inputs.scan_label || '—' }}
+            **Run:** #${{ github.run_number }}
+            **Status:** ${{ job.status }}
+
+            ---
+
+            📊 **[View Live Report](${{ steps.deployment.outputs.page_url }})**
+
+            📂 **[Browse Archive](https://github.com/${{ github.repository }}/blob/gh-pages/archive/site1/index.html)**
+
+            📁 **[Download ZIP](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})**
+
+      # ── Email — Option B: SendGrid (Workspace accounts / Gmail alternative) ─
+      # Free tier: 100 emails/day. Sign up at sendgrid.com, get an API key.
+      # Requires secrets: SENDGRID_API_KEY, MAIL_TO, MAIL_FROM
+      - name: Send email (SendGrid)
+        if: ${{ always() && secrets.SENDGRID_API_KEY != '' }}
+        uses: peter-evans/sendgrid-action@v1
+        with:
+          api-key: ${{ secrets.SENDGRID_API_KEY }}
+          to: ${{ secrets.MAIL_TO }}
+          from: ${{ secrets.MAIL_FROM }}
+          subject: "🔗 Broken Link Report — Run #${{ github.run_number }}"
+          body: |
+            Broken Link Report Complete.
+            Site: ${{ github.event.inputs.base_url || 'Scheduled' }}
+            Mode: ${{ github.event.inputs.scan_mode || 'full' }}
+            Live report: ${{ steps.deployment.outputs.page_url }}
+            Download: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
       - name: Write job summary
         if: always()
         run: |
           echo "## ✅ Scan Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Live report:** ${{ steps.deployment.outputs.page_url }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
