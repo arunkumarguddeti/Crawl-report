@@ -1477,6 +1477,33 @@ async def main():
     print(f"              {xlsx_path}")
     print(f"{'─'*60}\n")
 
+    # Write summary.json so the workflow can read stats for the email body
+    redirects  = sum(1 for r in results if str(r["status"]).startswith("3"))
+    srv_errors = sum(1 for r in results if str(r["status"]).startswith("5"))
+    timeouts   = sum(1 for r in results if "Error" in str(r["status"]) or "Timeout" in str(r["status"]))
+    internal   = sum(1 for r in results if r.get("link_type") == "Internal")
+    external   = sum(1 for r in results if r.get("link_type") == "External")
+    summary_data = {
+        "url":           CONFIG["BASE_URL"],
+        "mode":          mode_str,
+        "label":         label,
+        "run_date":      run_date,
+        "duration":      dur_str,
+        "pages":         pages_crawled,
+        "total_links":   len(results),
+        "ok":            ok,
+        "broken":        broken,
+        "redirects":     redirects,
+        "server_errors": srv_errors,
+        "timeouts":      timeouts,
+        "internal":      internal,
+        "external":      external,
+    }
+    summary_path = str(output_dir / "summary.json")
+    with open(summary_path, "w", encoding="utf-8") as sf:
+        json.dump(summary_data, sf, indent=2)
+    log.info("summary.json written → %s", summary_path)
+
     if os.getenv("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as gf:
             gf.write(f"## {'🎯 Targeted Scan' if scan_mode=='targeted' else '🌐 Full Crawl'} — `{CONFIG['BASE_URL']}`\n\n")

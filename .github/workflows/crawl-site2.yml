@@ -158,7 +158,7 @@ jobs:
               name = f.name
               m = re.search(r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", name)
               label = f"{m.group(1)}-{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}:{m.group(6)} EST" if m else name
-              rows += f'<tr><td><a href="site2/{name}">{label}</a></td><td>{name}</td></tr>\n'
+              rows += f'<tr><td><a href="{name}">{label}</a></td><td>{name}</td></tr>\n'
           html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
           <title>Site 2 Archive</title>
           <style>body{{font-family:sans-serif;background:#0f172a;color:#e2e8f0;padding:30px}}
@@ -210,6 +210,28 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
+      - name: Read crawl stats
+        if: always()
+        id: stats
+        run: |
+          if [ -f reports/summary.json ]; then
+            python3 -c "
+          import json
+          s = json.load(open('reports/summary.json'))
+          print('PAGES='    + str(s['pages']))
+          print('TOTAL='    + str(s['total_links']))
+          print('OK='       + str(s['ok']))
+          print('BROKEN='   + str(s['broken']))
+          print('REDIRECTS='+ str(s['redirects']))
+          print('ERRORS='   + str(s['server_errors']))
+          print('TIMEOUTS=' + str(s['timeouts']))
+          print('INTERNAL=' + str(s['internal']))
+          print('EXTERNAL=' + str(s['external']))
+          print('DURATION=' + str(s['duration']))
+          print('RUN_DATE=' + str(s['run_date']))
+          " >> $GITHUB_OUTPUT
+          fi
+
       - name: Send email
         if: always()
         uses: dawidd6/action-send-mail@v4
@@ -221,30 +243,43 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_TO }}
           from: Crawl Reports <${{ secrets.MAIL_USERNAME }}>
-          subject: "Broken Link Report — Site 2 — Run #${{ github.run_number }} — ${{ job.status }}"
+          subject: "Broken Link Report — ${{ steps.site.outputs.url }} — ${{ job.status }}"
           convert_markdown: false
           body: |
-            Broken Link Report — Site 2
+            Broken Link Report
+            Site:     ${{ steps.site.outputs.url }}
+            Mode:     ${{ github.event.inputs.scan_mode || 'full (scheduled)' }}
+            Run Date: ${{ steps.stats.outputs.RUN_DATE }}
+            Duration: ${{ steps.stats.outputs.DURATION }}
 
-            Site: ${{ steps.site.outputs.url }}
-            Run #${{ github.run_number }} | Status: ${{ job.status }}
-            Mode: ${{ github.event.inputs.scan_mode || 'full (scheduled)' }}
-            Label: ${{ github.event.inputs.scan_label || 'none' }}
-
-            ── QUICK SUMMARY ──────────────────────────────
-            See attached or visit the links below for full results.
-            The report table shows Broken, Redirect, Timeout and Error links.
-            200 OK links are in the Excel/CSV exports only.
-            ───────────────────────────────────────────────
+            ══════════════════════════════════════════
+              CRAWL RESULTS
+            ══════════════════════════════════════════
+              Parent Pages:     ${{ steps.stats.outputs.PAGES }}
+              Total Links:      ${{ steps.stats.outputs.TOTAL }}
+            ──────────────────────────────────────────
+              200 OK:           ${{ steps.stats.outputs.OK }}
+              Broken (404/410): ${{ steps.stats.outputs.BROKEN }}
+              Redirects (3xx):  ${{ steps.stats.outputs.REDIRECTS }}
+              Server Errors:    ${{ steps.stats.outputs.ERRORS }}
+              Timeout / Error:  ${{ steps.stats.outputs.TIMEOUTS }}
+            ──────────────────────────────────────────
+              Internal Links:   ${{ steps.stats.outputs.INTERNAL }}
+              External Links:   ${{ steps.stats.outputs.EXTERNAL }}
+            ══════════════════════════════════════════
 
             View Live Report:
             ${{ steps.deployment.outputs.page_url }}
 
-            Browse Archive (Site 2):
-            https://arunkumarguddeti.github.io/Crawl-report/archive/site2/
+            Browse Archive:
+            https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/archive/site2/
 
             Download ZIP (HTML + CSV + Excel):
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ──────────────────────────────────────────
+            Run #${{ github.run_number }} | Status: ${{ job.status }}
+
       - name: Write job summary
         if: always()
         run: |
@@ -253,7 +288,7 @@ jobs:
           echo "| | Link |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| 📊 Live Report | ${{ steps.deployment.outputs.page_url }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📂 Archive | https://arunkumarguddeti.github.io/Crawl-report/archive/site2/ |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📂 Archive | https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/archive/site2/ |" >> $GITHUB_STEP_SUMMARY
           echo "| 📁 ZIP Artifact | https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| File | Size |" >> $GITHUB_STEP_SUMMARY

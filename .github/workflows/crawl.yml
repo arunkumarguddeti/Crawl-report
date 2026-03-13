@@ -153,7 +153,7 @@ jobs:
               name = f.name
               m = re.search(r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", name)
               label = f"{m.group(1)}-{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}:{m.group(6)} EST" if m else name
-              rows += f'<tr><td><a href="adhoc/{name}">{label}</a></td><td>{name}</td></tr>\n'
+              rows += f'<tr><td><a href="{name}">{label}</a></td><td>{name}</td></tr>\n'
           html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
           <title>Ad-Hoc Archive</title>
           <style>body{{font-family:sans-serif;background:#0f172a;color:#e2e8f0;padding:30px}}
@@ -205,6 +205,28 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
+      - name: Read crawl stats
+        if: always()
+        id: stats
+        run: |
+          if [ -f reports/summary.json ]; then
+            python3 -c "
+          import json
+          s = json.load(open('reports/summary.json'))
+          print('PAGES='    + str(s['pages']))
+          print('TOTAL='    + str(s['total_links']))
+          print('OK='       + str(s['ok']))
+          print('BROKEN='   + str(s['broken']))
+          print('REDIRECTS='+ str(s['redirects']))
+          print('ERRORS='   + str(s['server_errors']))
+          print('TIMEOUTS=' + str(s['timeouts']))
+          print('INTERNAL=' + str(s['internal']))
+          print('EXTERNAL=' + str(s['external']))
+          print('DURATION=' + str(s['duration']))
+          print('RUN_DATE=' + str(s['run_date']))
+          " >> $GITHUB_OUTPUT
+          fi
+
       - name: Send email
         if: always()
         uses: dawidd6/action-send-mail@v4
@@ -216,29 +238,42 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_TO }}
           from: Crawl Reports <${{ secrets.MAIL_USERNAME }}>
-          subject: "Broken Link Report — Ad-Hoc — Run #${{ github.run_number }} — ${{ job.status }}"
+          subject: "Broken Link Report — ${{ github.event.inputs.base_url }} — ${{ job.status }}"
           convert_markdown: false
           body: |
-            Broken Link Report — Ad-Hoc Scan
+            Broken Link Report
+            Site:     ${{ github.event.inputs.base_url }}
+            Mode:     ${{ github.event.inputs.scan_mode }}
+            Run Date: ${{ steps.stats.outputs.RUN_DATE }}
+            Duration: ${{ steps.stats.outputs.DURATION }}
 
-            Run #${{ github.run_number }} | Status: ${{ job.status }}
-            URL: ${{ github.event.inputs.base_url }}
-            Mode: ${{ github.event.inputs.scan_mode }}
-            Label: ${{ github.event.inputs.scan_label || 'none' }}
-
-            ── QUICK SUMMARY ──────────────────────────────
-            The report table shows Broken, Redirect, Timeout and Error links.
-            200 OK links are in the Excel/CSV exports only.
-            ───────────────────────────────────────────────
+            ══════════════════════════════════════════
+              CRAWL RESULTS
+            ══════════════════════════════════════════
+              Parent Pages:     ${{ steps.stats.outputs.PAGES }}
+              Total Links:      ${{ steps.stats.outputs.TOTAL }}
+            ──────────────────────────────────────────
+              200 OK:           ${{ steps.stats.outputs.OK }}
+              Broken (404/410): ${{ steps.stats.outputs.BROKEN }}
+              Redirects (3xx):  ${{ steps.stats.outputs.REDIRECTS }}
+              Server Errors:    ${{ steps.stats.outputs.ERRORS }}
+              Timeout / Error:  ${{ steps.stats.outputs.TIMEOUTS }}
+            ──────────────────────────────────────────
+              Internal Links:   ${{ steps.stats.outputs.INTERNAL }}
+              External Links:   ${{ steps.stats.outputs.EXTERNAL }}
+            ══════════════════════════════════════════
 
             View Live Report:
             ${{ steps.deployment.outputs.page_url }}
 
-            Browse Ad-Hoc Archive:
-            https://arunkumarguddeti.github.io/Crawl-report/archive/adhoc/
+            Browse Archive:
+            https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/archive/adhoc/
 
             Download ZIP (HTML + CSV + Excel):
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ──────────────────────────────────────────
+            Run #${{ github.run_number }} | Status: ${{ job.status }}
 
       - name: Write job summary
         if: always()
@@ -249,7 +284,7 @@ jobs:
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| 🌐 URL Crawled | ${{ github.event.inputs.base_url }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 📊 Live Report | ${{ steps.deployment.outputs.page_url }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📂 Archive | https://arunkumarguddeti.github.io/Crawl-report/archive/adhoc/ |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📂 Archive | https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/archive/adhoc/ |" >> $GITHUB_STEP_SUMMARY
           echo "| 📁 ZIP Artifact | https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
