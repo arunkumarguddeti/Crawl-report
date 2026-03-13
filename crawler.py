@@ -726,6 +726,9 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
             '</ul></div>'
         )
 
+    else:
+        targeted_info_html = ""
+
     def row_class(status):
         s = str(status)
         if s == "200":         return "ok"

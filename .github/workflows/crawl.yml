@@ -74,6 +74,8 @@ jobs:
     name: Crawl (${{ github.event.inputs.scan_mode || 'scheduled-full' }})
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -81,8 +83,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       # ── DST dedup: skip if we already ran in the last 8 hours ──────────
       # Cache key = site1 + date + AM or PM slot.
@@ -121,8 +121,6 @@ jobs:
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -207,8 +205,6 @@ jobs:
       - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
         if: always()
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           name: report-${{ github.event.inputs.scan_mode || 'full' }}-${{ github.event.inputs.scan_label || github.run_number }}
           path: |
