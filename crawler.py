@@ -396,7 +396,7 @@ async def targeted_crawl(target_urls: list[str]) -> list[dict]:
                     "depth":     0,
                     "effort":    effort_level(status),
                     "category":  status_category(status),
-                    "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S EST"),
+                    "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S %Z"),
                 })
                 return
 
@@ -428,7 +428,7 @@ async def targeted_crawl(target_urls: list[str]) -> list[dict]:
                     "depth":     0,
                     "effort":    effort_level(lnk_status),
                     "category":  status_category(lnk_status),
-                    "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S EST"),
+                    "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S %Z"),
                 })
 
             await asyncio.gather(*[check_one(lu, lt) for lu, lt in page_links])
@@ -562,7 +562,7 @@ async def crawl() -> list[dict]:
                         "depth":     depth,
                         "effort":    effort_level(status),
                         "category":  status_category(status),
-                        "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S EST"),
+                        "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S %Z"),
                     })
                     return
 
@@ -594,7 +594,7 @@ async def crawl() -> list[dict]:
                         "depth":     depth,
                         "effort":    effort_level(lnk_status),
                         "category":  status_category(lnk_status),
-                        "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S EST"),
+                        "timestamp": now_est().strftime("%Y-%m-%d %H:%M:%S %Z"),
                     })
 
                     # ── Decide whether to crawl this link ─────────────────
@@ -687,7 +687,7 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
     bar_labels = json.dumps([p[:60]+"…" if len(p) > 60 else p for p,_ in top_broken])
     bar_values = json.dumps([v for _,v in top_broken])
 
-    run_date   = now_est().strftime("%Y-%m-%d %H:%M:%S EST")
+    run_date   = now_est().strftime("%Y-%m-%d %H:%M:%S %Z")
     run_dur    = fmt_duration(elapsed)
     # In targeted mode, derive display URL from first target page if BASE_URL is still default
     _default_url = "https://www.example.com"
@@ -1205,7 +1205,7 @@ function buildWorkbook(data, sheetName){{
   const summary = [
     ['Broken Link Report'],
     ['Site', '{base_url}'],
-    ['Run Date (EST)', '{run_date}'],
+    ['Run Date (ET)',  '{run_date}'],
     ['Duration', '{run_dur}'],
     [''],
     ['Metric','Count'],
@@ -1369,7 +1369,7 @@ def write_excel(results: list[dict], path: str):
     summary_rows = [
         ("Broken Link Report", None),
         ("Site", CONFIG["BASE_URL"]),
-        ("Run Date (EST)", now_est().strftime("%Y-%m-%d %H:%M:%S EST")),
+        ("Run Date (ET)",  now_est().strftime("%Y-%m-%d %H:%M:%S %Z")),
         (None, None),
         ("Metric", "Count"),
         ("Parent Pages Crawled", pages),
@@ -1429,7 +1429,7 @@ async def main():
 
     elapsed  = time.time() - start_time
     dur_str  = fmt_duration(elapsed)
-    run_date = now_est().strftime("%Y-%m-%d %H:%M:%S EST")
+    run_date = now_est().strftime("%Y-%m-%d %H:%M:%S %Z")
     ts_tag   = now_est().strftime("%Y%m%d_%H%M%S")
     label    = CONFIG.get("SCAN_LABEL", "")
     safe_label = label.replace(" ", "_").replace("/", "_")[:30] if label else ""
@@ -1516,7 +1516,7 @@ async def main():
                 gf.write("\n")
             gf.write(f"| Metric | Value |\n|---|---|\n")
             gf.write(f"| Mode | {mode_str} |\n")
-            gf.write(f"| Run Date (EST) | {run_date} |\n")
+            gf.write(f"| Run Date (ET)  | {run_date} |\n")
             gf.write(f"| Pages Scanned | {pages_crawled:,} |\n")
             gf.write(f"| Total Links | {len(results):,} |\n")
             gf.write(f"| 200 OK | {ok:,} |\n")
