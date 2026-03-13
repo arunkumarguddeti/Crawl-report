@@ -44,7 +44,6 @@ jobs:
               "ref": "main",
               "inputs": {
                 "scan_mode": "${{ github.event.inputs.scan_mode }}",
-                "base_url": "",
                 "target_pages": "",
                 "scan_label": "${{ github.event.inputs.scan_label }}"
               }
@@ -65,7 +64,6 @@ jobs:
               "ref": "main",
               "inputs": {
                 "scan_mode": "${{ github.event.inputs.scan_mode }}",
-                "base_url": "",
                 "target_pages": "",
                 "scan_label": "${{ github.event.inputs.scan_label }}"
               }
@@ -86,7 +84,6 @@ jobs:
               "ref": "main",
               "inputs": {
                 "scan_mode": "${{ github.event.inputs.scan_mode }}",
-                "base_url": "",
                 "target_pages": "",
                 "scan_label": "${{ github.event.inputs.scan_label }}"
               }
@@ -107,7 +104,6 @@ jobs:
               "ref": "main",
               "inputs": {
                 "scan_mode": "${{ github.event.inputs.scan_mode }}",
-                "base_url": "",
                 "target_pages": "",
                 "scan_label": "${{ github.event.inputs.scan_label }}"
               }

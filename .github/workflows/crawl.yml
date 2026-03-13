@@ -164,9 +164,18 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin gh-pages 2>/dev/null || true
-          git worktree add /tmp/gh-pages origin/gh-pages 2>/dev/null || \
-            (git worktree add --orphan -b gh-pages /tmp/gh-pages && echo "Created gh-pages")
+          # Fetch gh-pages if it exists, otherwise create it fresh
+          if git fetch origin gh-pages 2>/dev/null; then
+            git worktree add /tmp/gh-pages origin/gh-pages
+          else
+            echo "gh-pages branch does not exist yet — creating it"
+            git worktree add --orphan -b gh-pages /tmp/gh-pages
+            # Create an empty commit so the branch exists in remote
+            cd /tmp/gh-pages
+            git commit --allow-empty -m "Initialize gh-pages branch"
+            git push origin gh-pages
+            cd -
+          fi
           mkdir -p /tmp/gh-pages/archive/site1
           cp reports/*.html /tmp/gh-pages/archive/site1/ 2>/dev/null || true
           cp reports/*.csv  /tmp/gh-pages/archive/site1/ 2>/dev/null || true
@@ -198,7 +207,7 @@ jobs:
           PYEOF
           git add -A
           git diff --cached --quiet || git commit -m "Archive site1 $(date -u +'%Y-%m-%d %H:%M UTC')"
-          git push origin gh-pages
+          git push origin HEAD:gh-pages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
