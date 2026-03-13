@@ -122,7 +122,7 @@ jobs:
       - name: Capture site URL
         id: site
         run: |
-          URL="${ github.event.inputs.base_url || secrets.BASE_URL_SITE4 }"
+          URL="${{ github.event.inputs.base_url || secrets.BASE_URL_SITE4 }}"
           echo "url=$URL" >> $GITHUB_OUTPUT
           echo "Site URL: $URL"
 
