@@ -514,7 +514,7 @@ async def crawl() -> list[dict]:
 
         while queue:
             # ── Hard stop: MAX_PAGES reached ──────────────────────────────
-            if len(visited_pages) >= CONFIG["MAX_PAGES"]:
+            if CONFIG["MAX_PAGES"] > 0 and len(visited_pages) >= CONFIG["MAX_PAGES"]:
                 log.warning("MAX_PAGES cap (%d) reached — crawl complete.",
                             CONFIG["MAX_PAGES"])
                 break
@@ -602,7 +602,7 @@ async def crawl() -> list[dict]:
                         return  # never crawl external domains
                     if str(lnk_status) not in ("200", "301", "302"):
                         return  # don't queue broken/errored pages
-                    if len(visited_pages) >= CONFIG["MAX_PAGES"]:
+                    if CONFIG["MAX_PAGES"] > 0 and len(visited_pages) >= CONFIG["MAX_PAGES"]:
                         return  # hard page cap — stop queueing
 
                     # Trap-pattern check with counter for reporting
@@ -1408,8 +1408,9 @@ def write_excel(results: list[dict], path: str):
 async def main():
     start_time = time.time()
     log.info("Starting — BASE_URL=%s", CONFIG["BASE_URL"])
-    log.info("Config: MAX_DEPTH=%d  MAX_PAGES=%d  CONCURRENCY=%d  TIMEOUT=%ds",
-             CONFIG["MAX_DEPTH"], CONFIG["MAX_PAGES"],
+    pages_display = "unlimited" if CONFIG["MAX_PAGES"] == 0 else str(CONFIG["MAX_PAGES"])
+    log.info("Config: MAX_DEPTH=%d  MAX_PAGES=%s  CONCURRENCY=%d  TIMEOUT=%ds",
+             CONFIG["MAX_DEPTH"], pages_display,
              CONFIG["CONCURRENCY"], CONFIG["TIMEOUT"])
 
     # ── Decide crawl mode ────────────────────────────────────────
