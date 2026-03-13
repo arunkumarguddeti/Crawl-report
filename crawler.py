@@ -1439,13 +1439,12 @@ async def main():
 </div></body></html>"""
         (output_dir / "index.html").write_text(empty_html, encoding="utf-8")
         import json as _json
-        _json.dump({{"url": CONFIG["BASE_URL"], "mode": "failed", "label": "",
+        _json.dump({"url": CONFIG["BASE_URL"], "mode": "failed", "label": "",
                      "run_date": now_est().strftime("%Y-%m-%d %H:%M:%S %Z"),
                      "duration": "0s", "pages": 0, "total_links": 0, "ok": 0,
                      "broken": 0, "redirects": 0, "server_errors": 0,
-                     "timeouts": 0, "internal": 0, "external": 0}},
+                     "timeouts": 0, "internal": 0, "external": 0},
                     open(str(output_dir / "summary.json"), "w"))
-        return
         return
 
     elapsed  = time.time() - start_time
