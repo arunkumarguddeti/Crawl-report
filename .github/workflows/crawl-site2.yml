@@ -249,4 +249,13 @@ jobs:
         if: always()
         run: |
           echo "## ✅ Site 2 Scan Complete" >> $GITHUB_STEP_SUMMARY
-          echo "**Live:** ${{ steps.deployment.outputs.page_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | Link |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 📊 Live Report | ${{ steps.deployment.outputs.page_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📂 Archive | https://arunkumarguddeti.github.io/Crawl-report/archive/site2/ |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📁 ZIP Artifact | https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          ls -lh reports/ | awk 'NR>1 {print "| " $9 " | " $5 " |"}' >> $GITHUB_STEP_SUMMARY || true

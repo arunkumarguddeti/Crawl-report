@@ -1242,7 +1242,7 @@ function rowsToCsv(data){{
   const keys    = ['pu','lu','lt','tp','st','ca','dp','ef','lm','ts'];
   const escape  = v => {{
     const s = v===null||v===undefined?'':String(v);
-    return s.includes(',') || s.includes('"') || s.includes('\n')
+    return s.includes(',') || s.includes('"') || s.includes('\\n')
       ? '"' + s.replace(/"/g,'""') + '"' : s;
   }};
   const rows = [headers.join(',')];
@@ -1252,7 +1252,7 @@ function rowsToCsv(data){{
       return escape(k==='lm'&&v===-1?'':v);
     }}).join(','));
   }});
-  return rows.join('\n');
+  return rows.join('\\n');
 }}
 
 function downloadCsv(content, filename){{
