@@ -55,8 +55,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: crawl-site3-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   crawl-site3:
