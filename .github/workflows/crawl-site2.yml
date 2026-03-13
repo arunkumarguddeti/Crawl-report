@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────
-#  crawl-site2.yml — Site 2
-#  Runs 30 min after Site 1 to avoid Pages deployment conflicts.
-#  Same EST/EDT dedup logic as crawl.yml.
+#  crawl-site2.yml
+#  Set BASE_URL_SITE2 in repo Settings → Secrets → Actions
+#  Runs 60 min after Site 1 to avoid Pages conflicts.
 # ─────────────────────────────────────────────────────────────
 name: Broken Link Crawler — Site 2
 
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       scan_mode:
-        description: 'Scan mode'
+        description: 'Scan mode — choose FIRST'
         required: true
         default: 'full'
         type: choice
@@ -17,26 +17,37 @@ on:
           - full
           - targeted
       base_url:
-        description: 'Website base URL'
+        description: '[FULL MODE] Website to crawl / [TARGETED MODE] Site root for domain matching'
         required: false
         default: ''
       target_pages:
-        description: '[TARGETED ONLY] Comma-separated page URLs'
+        description: '[TARGETED ONLY] Comma-separated URLs. Example: https://site.com/about,https://site.com/contact'
         required: false
         default: ''
       scan_label:
-        description: 'Optional label'
+        description: 'Optional label shown in report header (e.g. "Sprint-42")'
         required: false
-        default: 'site2'
+        default: ''
+      max_depth:
+        description: '[FULL MODE] Max crawl depth'
+        required: false
+        default: '8'
+      max_pages:
+        description: '[FULL MODE] Max pages to crawl'
+        required: false
+        default: '3000'
+      concurrency:
+        description: 'Parallel workers'
+        required: false
+        default: '10'
 
   schedule:
-    #  Staggered 30 min after Site 1 to avoid Pages conflicts.
     #  EST (UTC-5):  6:30 AM = 11:30 UTC  |  8:30 PM = 01:30 UTC
     #  EDT (UTC-4):  6:30 AM = 10:30 UTC  |  8:30 PM = 00:30 UTC
-    # - cron: '30 11 * * *'  # 6:30 AM EST (disabled)
-    - cron: '30 10 * * *'  # 6:30 AM EDT (UTC-4)
-    # - cron: '30 1  * * *'  # 8:30 PM EST (disabled)
-    - cron: '30 0  * * *'  # 8:30 PM EDT (UTC-4)
+    # - cron: '30 11 * * *'  # 6:30 AM EST (disabled — EDT active)
+    - cron: '30 10 * * *'   # 6:30 AM EDT (UTC-4)
+    # - cron: '30 1  * * *'  # 8:30 PM EST (disabled — EDT active)
+    - cron: '30 0  * * *'   # 8:30 PM EDT (UTC-4)
 
 permissions:
   contents: write
@@ -72,6 +83,7 @@ jobs:
           else SLOT="night"
           fi
           echo "slot_key=site2-${DATE}-${SLOT}" >> $GITHUB_OUTPUT
+          echo "Slot: site2-${DATE}-${SLOT}"
 
       - name: Restore dedup cache
         id: cache
@@ -83,7 +95,7 @@ jobs:
 
       - name: Skip if already ran this slot
         if: github.event_name == 'schedule' && steps.cache.outputs.cache-hit == 'true'
-        run: echo "Already ran this slot — skipping." && exit 0
+        run: echo "Already ran this slot — skipping duplicate DST trigger." && exit 0
 
       - name: Mark slot as used
         if: github.event_name == 'schedule'
@@ -97,6 +109,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Validate inputs
+        run: |
+          MODE="${{ github.event.inputs.scan_mode }}"
+          PAGES="${{ github.event.inputs.target_pages }}"
+          if [ "$MODE" = "targeted" ] && [ -z "$PAGES" ]; then
+            echo "❌ scan_mode is 'targeted' but target_pages is empty."
+            exit 1
+          fi
+          echo "✅ Mode: ${MODE:-scheduled-full}"
+
       - name: Capture site URL
         id: site
         run: |
@@ -108,10 +130,10 @@ jobs:
         env:
           BASE_URL:       ${{ github.event.inputs.base_url || secrets.BASE_URL_SITE2 || 'https://www.site2.com' }}
           TARGET_PAGES:   ${{ github.event.inputs.target_pages || '' }}
-          SCAN_LABEL:     ${{ github.event.inputs.scan_label || 'site2' }}
-          MAX_DEPTH:      '8'
-          MAX_PAGES:      '3000'
-          CONCURRENCY:    '10'
+          SCAN_LABEL:     ${{ github.event.inputs.scan_label || '' }}
+          MAX_DEPTH:      ${{ github.event.inputs.max_depth || '8' }}
+          MAX_PAGES:      ${{ github.event.inputs.max_pages || '3000' }}
+          CONCURRENCY:    ${{ github.event.inputs.concurrency || '10' }}
           TIMEOUT:        '10'
           POLITE_DELAY:   '0.3'
           RESPECT_ROBOTS: 'true'
@@ -121,17 +143,19 @@ jobs:
       - name: Verify reports
         run: |
           ls -lh reports/
-          test -f reports/index.html && echo "✅ index.html found"
+          test -f reports/index.html && echo "✅ index.html found" || (echo "❌ Missing" && exit 1)
 
       - name: Archive report to gh-pages
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Fetch gh-pages if it exists, otherwise create it fresh
           if git fetch origin gh-pages 2>/dev/null; then
             git worktree add /tmp/gh-pages origin/gh-pages
           else
             echo "gh-pages branch does not exist yet — creating it"
             git worktree add --orphan -b gh-pages /tmp/gh-pages
+            # Create an empty commit so the branch exists in remote
             cd /tmp/gh-pages
             git commit --allow-empty -m "Initialize gh-pages branch"
             git push origin gh-pages
@@ -181,7 +205,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: site2-report-${{ github.run_number }}
+          name: site2-report-${{ github.event.inputs.scan_label || github.run_number }}
           path: |
             reports/*.html
             reports/*.csv

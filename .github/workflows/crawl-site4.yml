@@ -42,12 +42,12 @@ on:
         default: '10'
 
   schedule:
-    #  EST (UTC-5):  7:30 AM = 12:00 UTC  |  9:30 PM = 02:00 UTC
-    #  EDT (UTC-4):  7:30 AM = 11:00 UTC  |  9:30 PM = 01:00 UTC
-    # - cron: '30 12 * * *'  # 7:30 AM EST (disabled)
-    - cron: '30 11 * * *'  # 7:30 AM EDT (UTC-4)
-    # - cron: '30 2  * * *'  # 9:30 PM EST (disabled)
-    - cron: '30 1  * * *'  # 9:30 PM EDT (UTC-4)
+    #  EST (UTC-5):  7:30 AM = 12:30 UTC  |  9:30 PM = 02:30 UTC
+    #  EDT (UTC-4):  7:30 AM = 11:30 UTC  |  9:30 PM = 01:30 UTC
+    # - cron: '30 12 * * *'  # 7:30 AM EST (disabled — EDT active)
+    - cron: '30 11 * * *'   # 7:30 AM EDT (UTC-4)
+    # - cron: '30 2  * * *'  # 9:30 PM EST (disabled — EDT active)
+    - cron: '30 1  * * *'   # 9:30 PM EDT (UTC-4)
 
 permissions:
   contents: write

@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────
 #  crawl-site3.yml
 #  Set BASE_URL_SITE3 in repo Settings → Secrets → Actions
-#  Runs 60 min after Site 1 to avoid Pages conflicts.
+#  Runs at 7 AM / 9 PM EDT. Staggered 60 min after Site 1.
 # ─────────────────────────────────────────────────────────────
 name: Broken Link Crawler — Site 3
 
@@ -44,10 +44,10 @@ on:
   schedule:
     #  EST (UTC-5):  7:00 AM = 12:00 UTC  |  9:00 PM = 02:00 UTC
     #  EDT (UTC-4):  7:00 AM = 11:00 UTC  |  9:00 PM = 01:00 UTC
-    # - cron: '0 12 * * *'  # 7 AM EST (disabled)
-    - cron: '0 11 * * *'  # 7 AM EDT (UTC-4)
-    # - cron: '0 2  * * *'  # 9 PM EST (disabled)
-    - cron: '0 1  * * *'  # 9 PM EDT (UTC-4)
+    # - cron: '0 12 * * *'   # 7 AM EST (disabled — EDT active)
+    - cron: '0 11 * * *'    # 7 AM EDT (UTC-4)
+    # - cron: '0 2  * * *'   # 9 PM EST (disabled — EDT active)
+    - cron: '0 1  * * *'    # 9 PM EDT (UTC-4)
 
 permissions:
   contents: write

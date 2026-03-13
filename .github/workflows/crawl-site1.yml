@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────
-#  crawl.yml — Site 1
-#  Handles EST (UTC-5) AND EDT (UTC-4) automatically.
-#  Dedup cache prevents double-run on DST transition days.
+#  crawl-site1.yml
+#  Set BASE_URL_SITE1 in repo Settings → Secrets → Actions
+#  Runs 60 min after Site 1 to avoid Pages conflicts.
 # ─────────────────────────────────────────────────────────────
 name: Broken Link Crawler — Site 1
 
@@ -9,56 +9,45 @@ on:
   workflow_dispatch:
     inputs:
       scan_mode:
-        description: 'Scan mode — choose FIRST, then fill the fields below accordingly'
+        description: 'Scan mode — choose FIRST'
         required: true
         default: 'full'
         type: choice
         options:
           - full
           - targeted
-
       base_url:
-        description: |
-          [FULL MODE] Website to crawl from root.
-          [TARGETED MODE] Site root — used for Internal vs External classification.
+        description: '[FULL MODE] Website to crawl / [TARGETED MODE] Site root for domain matching'
         required: false
         default: ''
-
       target_pages:
-        description: |
-          [TARGETED MODE ONLY] Comma-separated URLs to scan.
-          Example: https://site.com/about,https://site.com/contact
+        description: '[TARGETED ONLY] Comma-separated URLs. Example: https://site.com/about,https://site.com/contact'
         required: false
         default: ''
-
       scan_label:
-        description: 'Optional label shown in report (e.g. "Sprint-42")'
+        description: 'Optional label shown in report header (e.g. "Sprint-42")'
         required: false
         default: ''
-
       max_depth:
         description: '[FULL MODE] Max crawl depth'
         required: false
         default: '8'
-
       max_pages:
         description: '[FULL MODE] Max pages to crawl'
         required: false
         default: '3000'
-
       concurrency:
         description: 'Parallel workers'
         required: false
         default: '10'
 
   schedule:
-    #  EST (UTC-5):  6 AM = 11:00 UTC  |  8 PM = 01:00 UTC
-    #  EDT (UTC-4):  6 AM = 10:00 UTC  |  8 PM = 00:00 UTC
-    #  All 4 crons run, but the dedup step below prevents double-execution.
+    #  EST (UTC-5):  6:00 AM = 11:00 UTC  |  8:00 PM = 01:00 UTC
+    #  EDT (UTC-4):  6:00 AM = 10:00 UTC  |  8:00 PM = 00:00 UTC
     # - cron: '0 11 * * *'   # 6 AM EST (disabled — EDT active)
-    - cron: '0 10 * * *'   # 6 AM EDT (UTC-4)
+    - cron: '0 10 * * *'    # 6 AM EDT (UTC-4)
     # - cron: '0 1  * * *'   # 8 PM EST (disabled — EDT active)
-    - cron: '0 0  * * *'   # 8 PM EDT (UTC-4)
+    - cron: '0 0  * * *'    # 8 PM EDT (UTC-4)
 
 permissions:
   contents: write
@@ -70,8 +59,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  crawl:
-    name: Crawl (${{ github.event.inputs.scan_mode || 'scheduled-full' }})
+  crawl-site1:
+    name: Crawl Site 1 (${{ github.event.inputs.scan_mode || 'scheduled-full' }})
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -81,17 +70,12 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── DST dedup: skip if we already ran in the last 8 hours ──────────
-      # Cache key = site1 + date + AM or PM slot.
-      # If the cache already exists this slot was already covered → exit 0.
       - name: Check dedup slot
         id: dedup
         if: github.event_name == 'schedule'
         run: |
-          # Determine which 8-hour slot we're in: 00-08 UTC (night), 08-16 UTC (day), 16-24 UTC (evening)
           HOUR=$(date -u +%H)
           DATE=$(TZ=America/New_York date +%Y-%m-%d)
           if   [ "$HOUR" -ge 8  ] && [ "$HOUR" -lt 16 ]; then SLOT="morning"
@@ -99,7 +83,7 @@ jobs:
           else SLOT="night"
           fi
           echo "slot_key=site1-${DATE}-${SLOT}" >> $GITHUB_OUTPUT
-          echo "Slot key: site1-${DATE}-${SLOT}"
+          echo "Slot: site1-${DATE}-${SLOT}"
 
       - name: Restore dedup cache
         id: cache
@@ -111,24 +95,19 @@ jobs:
 
       - name: Skip if already ran this slot
         if: github.event_name == 'schedule' && steps.cache.outputs.cache-hit == 'true'
-        run: |
-          echo "✅ Already ran in this slot — skipping duplicate DST trigger."
-          exit 0
+        run: echo "Already ran this slot — skipping duplicate DST trigger." && exit 0
 
       - name: Mark slot as used
         if: github.event_name == 'schedule'
         run: mkdir -p .dedup && echo "done" > .dedup/ran
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Validate inputs
         run: |
@@ -149,7 +128,7 @@ jobs:
 
       - name: Run crawler
         env:
-          BASE_URL:       ${{ github.event.inputs.base_url || secrets.BASE_URL_SITE1 || 'https://www.example.com' }}
+          BASE_URL:       ${{ github.event.inputs.base_url || secrets.BASE_URL_SITE1 || 'https://www.site1.com' }}
           TARGET_PAGES:   ${{ github.event.inputs.target_pages || '' }}
           SCAN_LABEL:     ${{ github.event.inputs.scan_label || '' }}
           MAX_DEPTH:      ${{ github.event.inputs.max_depth || '8' }}
@@ -166,7 +145,6 @@ jobs:
           ls -lh reports/
           test -f reports/index.html && echo "✅ index.html found" || (echo "❌ Missing" && exit 1)
 
-      # ── Archive to gh-pages branch ─────────────────────────────────────
       - name: Archive report to gh-pages
         run: |
           git config user.name  "github-actions[bot]"
@@ -212,11 +190,10 @@ jobs:
           th,td{{padding:10px 14px;border:1px solid #334155}}th{{background:#1e293b}}
           tr:hover{{background:#1e293b}}</style></head>
           <body><h1>📂 Site 1 Report Archive</h1>
-          <p>{len(files)} reports · files auto-deleted after 60 days</p>
+          <p>{len(files)} reports · auto-deleted after 60 days</p>
           <table><thead><tr><th>Run Date (EST)</th><th>File</th></tr></thead>
           <tbody>{rows}</tbody></table></body></html>"""
           Path("archive/site1/index.html").write_text(html)
-          print(f"Archive: {len(files)} reports")
           PYEOF
           git add -A
           git diff --cached --quiet || git commit -m "Archive site1 $(date -u +'%Y-%m-%d %H:%M UTC')"
@@ -228,7 +205,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: report-${{ github.event.inputs.scan_mode || 'full' }}-${{ github.event.inputs.scan_label || github.run_number }}
+          name: site1-report-${{ github.event.inputs.scan_label || github.run_number }}
           path: |
             reports/*.html
             reports/*.csv
