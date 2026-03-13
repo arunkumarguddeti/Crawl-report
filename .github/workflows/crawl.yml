@@ -21,7 +21,7 @@ on:
         description: |
           [FULL MODE] Website to crawl from root.
           [TARGETED MODE] Site root — used for Internal vs External classification.
-        required: true
+        required: false
         default: ''
 
       target_pages:

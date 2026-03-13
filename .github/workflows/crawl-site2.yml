@@ -18,7 +18,7 @@ on:
           - targeted
       base_url:
         description: 'Website base URL'
-        required: true
+        required: false
         default: ''
       target_pages:
         description: '[TARGETED ONLY] Comma-separated page URLs'
