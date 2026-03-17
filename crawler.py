@@ -610,13 +610,22 @@ async def crawl() -> list[dict]:
                         trap_skipped += 1
                         return
 
-                    # safe_enqueue checks seen + MAX_QUEUE cap + skip_parse
-                    safe_enqueue(queue, seen, link_url, depth + 1)
+                    # Collect candidate URLs — sorted + enqueued after gather
+                    # so traversal order is deterministic regardless of network timing
+                    to_enqueue.append((link_url, depth + 1))
 
+                to_enqueue: list[tuple[str, int]] = []
                 await asyncio.gather(
                     *[check_one(lu, lt) for lu, lt in page_links])
+                # Sort by (depth, url) for consistent BFS order every run
+                for eq_url, eq_depth in sorted(to_enqueue, key=lambda x: (x[1], x[0])):
+                    safe_enqueue(queue, seen, eq_url, eq_depth)
 
             await asyncio.gather(*[process_page(u, d) for u, d in batch])
+            # Re-sort full queue after batch so depth ordering is always preserved
+            _sorted = sorted(queue, key=lambda x: (x[1], x[0]))
+            queue.clear()
+            queue.extend(_sorted)
 
             if CONFIG["POLITE_DELAY"] > 0:
                 await asyncio.sleep(CONFIG["POLITE_DELAY"])
