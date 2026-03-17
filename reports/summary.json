@@ -1,0 +1,16 @@
+{
+  "url": "https://fai.gov/",
+  "mode": "FULL CRAWL",
+  "label": "",
+  "run_date": "2026-03-17 10:06:23 EDT",
+  "duration": "0:04:09",
+  "pages": 1529,
+  "total_links": 23968,
+  "ok": 21470,
+  "broken": 220,
+  "redirects": 0,
+  "server_errors": 1,
+  "timeouts": 47,
+  "internal": 17663,
+  "external": 4972
+}
