@@ -62,7 +62,7 @@ CONFIG = {
     # Hard cap on queue size. Tag/category/pagination pages on WordPress and
     # similar CMSes can push the queue to 30,000+ entries. When this cap is
     # hit new URLs are silently dropped — already-queued pages still run.
-    "MAX_QUEUE":   int(os.getenv("MAX_QUEUE", "5000")),
+    "MAX_QUEUE":   int(os.getenv("MAX_QUEUE", "100000")),  # raised — 5000 was silently dropping pages
 
     # URL path fragments that signal crawl-trap pages.
     # URLs containing any of these strings will NOT be added to the crawl
@@ -468,6 +468,8 @@ def safe_enqueue(queue: deque, seen: set, url: str, depth: int) -> bool:
     if url in seen:
         return False
     if len(queue) >= CONFIG["MAX_QUEUE"]:
+        log.warning("MAX_QUEUE cap (%d) reached — URL silently dropped: %s",
+                    CONFIG["MAX_QUEUE"], url[:80])
         return False
     if is_trap_url(url):
         return False
@@ -1445,8 +1447,8 @@ async def main():
     start_time = time.time()
     log.info("Starting — BASE_URL=%s", CONFIG["BASE_URL"])
     pages_display = "unlimited" if CONFIG["MAX_PAGES"] == 0 else str(CONFIG["MAX_PAGES"])
-    log.info("Config: MAX_DEPTH=%d  MAX_PAGES=%s  CONCURRENCY=%d  TIMEOUT=%ds",
-             CONFIG["MAX_DEPTH"], pages_display,
+    log.info("Config: MAX_DEPTH=%d  MAX_PAGES=%s  MAX_QUEUE=%d  CONCURRENCY=%d  TIMEOUT=%ds",
+             CONFIG["MAX_DEPTH"], pages_display, CONFIG["MAX_QUEUE"],
              CONFIG["CONCURRENCY"], CONFIG["TIMEOUT"])
 
     # ── Decide crawl mode ────────────────────────────────────────
