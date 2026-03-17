@@ -542,6 +542,13 @@ async def crawl() -> list[dict]:
                      len(queue), trap_skipped)
 
             # ── Process each page in the batch concurrently ───────────────
+            # batch_candidates collects ALL new URLs discovered across ALL pages
+            # in this batch. We populate it during the concurrent gather, then
+            # sort + enqueue AFTER all pages finish — making every run
+            # deterministic regardless of which page's HTTP response arrived first.
+            batch_candidates: list[tuple[str, int]] = []
+            batch_trap_count = 0
+
             async def process_page(page_url: str, depth: int):
                 nonlocal trap_skipped
 
@@ -575,7 +582,7 @@ async def crawl() -> list[dict]:
 
                 # ── Check every link on this page (concurrent, cached) ────
                 async def check_one(link_url: str, link_text: str):
-                    nonlocal trap_skipped
+                    nonlocal batch_trap_count
                     async with sem:
                         lnk_status, lnk_final, lnk_load_ms = await check_link_status(
                             session, link_url, link_cache)
@@ -605,27 +612,26 @@ async def crawl() -> list[dict]:
                     if CONFIG["MAX_PAGES"] > 0 and len(visited_pages) >= CONFIG["MAX_PAGES"]:
                         return  # hard page cap — stop queueing
 
-                    # Trap-pattern check with counter for reporting
+                    # Trap-pattern check — count here, enqueue decision made later
                     if is_trap_url(link_url):
-                        trap_skipped += 1
+                        batch_trap_count += 1
                         return
 
-                    # Collect candidate URLs — sorted + enqueued after gather
-                    # so traversal order is deterministic regardless of network timing
-                    to_enqueue.append((link_url, depth + 1))
+                    # Collect into batch-level list — NOT into queue yet
+                    batch_candidates.append((link_url, depth + 1))
 
-                to_enqueue: list[tuple[str, int]] = []
                 await asyncio.gather(
                     *[check_one(lu, lt) for lu, lt in page_links])
-                # Sort by (depth, url) for consistent BFS order every run
-                for eq_url, eq_depth in sorted(to_enqueue, key=lambda x: (x[1], x[0])):
-                    safe_enqueue(queue, seen, eq_url, eq_depth)
 
             await asyncio.gather(*[process_page(u, d) for u, d in batch])
-            # Re-sort full queue after batch so depth ordering is always preserved
-            _sorted = sorted(queue, key=lambda x: (x[1], x[0]))
-            queue.clear()
-            queue.extend(_sorted)
+
+            # ── Deterministic enqueue: sort ALL candidates from the whole batch
+            # by (depth, url) so every run explores in the same order,
+            # regardless of which page's network response arrived first.
+            trap_skipped += batch_trap_count
+            for eq_url, eq_depth in sorted(batch_candidates,
+                                           key=lambda x: (x[1], x[0])):
+                safe_enqueue(queue, seen, eq_url, eq_depth)
 
             if CONFIG["POLITE_DELAY"] > 0:
                 await asyncio.sleep(CONFIG["POLITE_DELAY"])
