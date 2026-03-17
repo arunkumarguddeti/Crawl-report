@@ -1326,43 +1326,64 @@ def write_excel(results: list[dict], path: str):
 
     wb = openpyxl.Workbook()
 
-    # ── Sheet 1: All Links ────────────────────────────────────
-    ws = wb.active
-    ws.title = "All Links"
-    headers = ["Parent URL","Link URL","Anchor Text","Type","Status",
-               "Category","Depth","Effort","Load Time (ms)","Timestamp"]
+    EXCEL_MAX_ROWS = 1_048_576  # Excel hard limit including header row
+    headers    = ["Parent URL","Link URL","Anchor Text","Type","Status",
+                  "Category","Depth","Effort","Load Time (ms)","Timestamp"]
     col_widths = [70, 70, 35, 12, 12, 18, 8, 14, 16, 24]
 
-    for ci, (h, w) in enumerate(zip(headers, col_widths), 1):
-        cell = ws.cell(row=1, column=ci, value=h)
-        cell.font      = HDR_FONT
-        cell.fill      = HDR_FILL
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border    = BORDER
-        ws.column_dimensions[get_column_letter(ci)].width = w
-    ws.row_dimensions[1].height = 18
-    ws.freeze_panes = "A2"
-
-    for ri, r in enumerate(results, 2):
-        lm = r.get("load_ms", -1)
-        load_val = lm if lm not in (None, -1) else None
-        row_vals = [
-            r.get("page_url",""), r.get("link_url",""),
-            r.get("link_text",""), r.get("link_type",""),
-            str(r.get("status","")), r.get("category",""),
-            r.get("depth",""), r.get("effort",""),
-            load_val, str(r.get("timestamp",""))
-        ]
-        fill = STATUS_FILLS.get(rc(r.get("status","")))
-        for ci, val in enumerate(row_vals, 1):
-            cell = ws.cell(row=ri, column=ci, value=val)
+    def make_data_sheet(wb, title, rows, is_first=False):
+        """Write up to EXCEL_MAX_ROWS-1 data rows to a sheet with headers."""
+        ws = wb.active if is_first else wb.create_sheet(title)
+        ws.title = title
+        for ci, (h, w) in enumerate(zip(headers, col_widths), 1):
+            cell = ws.cell(row=1, column=ci, value=h)
+            cell.font      = HDR_FONT
+            cell.fill      = HDR_FILL
+            cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border    = BORDER
-            cell.alignment = Alignment(vertical="center",
-                                       wrap_text=(ci in (1,2)))
-            if fill:
-                cell.fill = fill
+            ws.column_dimensions[get_column_letter(ci)].width = w
+        ws.row_dimensions[1].height = 18
+        ws.freeze_panes = "A2"
+        for ri, r in enumerate(rows, 2):
+            if ri > EXCEL_MAX_ROWS:  # safety — never exceed Excel limit
+                log.warning("Excel sheet '%s' capped at %d rows", title, EXCEL_MAX_ROWS - 1)
+                break
+            lm = r.get("load_ms", -1)
+            load_val = lm if lm not in (None, -1) else None
+            row_vals = [
+                r.get("page_url",""), r.get("link_url",""),
+                r.get("link_text",""), r.get("link_type",""),
+                str(r.get("status","")), r.get("category",""),
+                r.get("depth",""), r.get("effort",""),
+                load_val, str(r.get("timestamp",""))
+            ]
+            fill = STATUS_FILLS.get(rc(r.get("status","")))
+            for ci, val in enumerate(row_vals, 1):
+                cell = ws.cell(row=ri, column=ci, value=val)
+                cell.border    = BORDER
+                cell.alignment = Alignment(vertical="center",
+                                           wrap_text=(ci in (1,2)))
+                if fill:
+                    cell.fill = fill
+        ws.auto_filter.ref = ws.dimensions
+        return ws
 
-    ws.auto_filter.ref = ws.dimensions
+    # ── Sheet 1+: All Links (split into chunks if > Excel row limit) ─────────
+    rows_per_sheet = EXCEL_MAX_ROWS - 1  # subtract header row
+    total_rows     = len(results)
+    num_sheets     = max(1, -(-total_rows // rows_per_sheet))  # ceiling division
+
+    if num_sheets == 1:
+        make_data_sheet(wb, "All Links", results, is_first=True)
+    else:
+        log.warning(
+            "Data has %d rows — exceeds Excel limit (%d). "
+            "Splitting into %d sheets. Full data is in the CSV.",
+            total_rows, EXCEL_MAX_ROWS, num_sheets)
+        for i in range(num_sheets):
+            chunk = results[i * rows_per_sheet : (i + 1) * rows_per_sheet]
+            title = f"All Links {i+1}" if i > 0 else "All Links"
+            make_data_sheet(wb, title, chunk, is_first=(i == 0))
 
     # ── Sheet 2: Summary ─────────────────────────────────────
     ws2 = wb.create_sheet("Summary")
@@ -1470,7 +1491,13 @@ async def main():
     xlsx_path  = str(output_dir / f"broken_links_{file_tag}.xlsx")
 
     write_csv(results, csv_path)
-    write_excel(results, xlsx_path)
+    # Excel: write non-200 rows only (broken/redirect/error/timeout).
+    # 200 OK rows make files enormous (2M+ rows) and are already in the CSV.
+    # For a 2.8M-row crawl this reduces Excel to ~15K rows — actually usable.
+    excel_rows = [r for r in results if str(r.get("status","")) != "200"]
+    log.info("Excel: writing %d non-200 rows (%d OK rows in CSV only)",
+             len(excel_rows), len(results) - len(excel_rows))
+    write_excel(excel_rows, xlsx_path)
 
     html = build_html_report(results, csv_path, elapsed,
                              scan_mode=scan_mode,
