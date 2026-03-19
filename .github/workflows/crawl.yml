@@ -1,15 +1,11 @@
-# ─────────────────────────────────────────────────────────────
-#  crawl.yml — Generic Ad-Hoc Crawler
+# ─────────────────────────────────────────────────────────────────────────────
+#  crawl.yml — Ad-Hoc Crawler (Any URL) with Checkpoint / Resume
 #
-#  Use this to run a one-off report for ANY URL on demand.
-#  - Not triggered by crawl-all.yml
-#  - Not scheduled (no cron)
-#  - No secrets tied to any specific site
-#  - Sends email notification on completion or failure
-#  - Has its own concurrency group — never blocked by site1-4
-#
-#  Just fill in base_url and hit Run workflow.
-# ─────────────────────────────────────────────────────────────
+#  - Manual trigger only (workflow_dispatch)
+#  - Auto-chains to itself if crawl exceeds 5h45m (Option 3)
+#  - On final run: deploys to GitHub Pages + sends email
+#  - Intermediate runs: save checkpoint artifact, auto-dispatch next run
+# ─────────────────────────────────────────────────────────────────────────────
 name: 🔍 Ad-Hoc Crawler (Any URL)
 
 on:
@@ -45,14 +41,34 @@ on:
         default: '8'
 
       max_pages:
-        description: 'Max pages to crawl'
+        description: 'Max pages to crawl (0 = unlimited)'
         required: false
-        default: '3000'
+        default: '0'
+
+      max_queue:
+        description: 'Max BFS queue size — lower prevents Drupal search/facet runaway (default: 20000)'
+        required: false
+        default: '20000'
+
+      extra_trap_patterns:
+        description: 'Extra comma-separated URL path substrings to exclude from crawling (e.g. /events/,/news/)'
+        required: false
+        default: ''
 
       concurrency:
-        description: 'Parallel workers'
+        description: 'Parallel workers (use 3 for slow/polite crawl)'
         required: false
         default: '10'
+
+      resume_from_run_id:
+        description: '⚙️ AUTO-FILLED — Run ID to resume checkpoint from (leave blank for new scan)'
+        required: false
+        default: ''
+
+      resume_run_count:
+        description: '⚙️ AUTO-FILLED — Chain run count (leave blank for new scan)'
+        required: false
+        default: '1'
 
 permissions:
   contents: write
@@ -76,6 +92,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - name: Check actor permission
         if: github.event_name == 'workflow_dispatch'
         run: |
@@ -84,7 +101,6 @@ jobs:
             exit 1
           fi
           echo "✅ Authorized: ${{ github.actor }}"
-
 
       - name: Validate inputs
         run: |
@@ -98,7 +114,13 @@ jobs:
             echo "❌ scan_mode is 'targeted' but target_pages is empty"
             exit 1
           fi
-          echo "✅ URL: ${{ github.event.inputs.base_url }} | Mode: $MODE"
+          RUN_ID="${{ github.event.inputs.resume_from_run_id }}"
+          RUN_COUNT="${{ github.event.inputs.resume_run_count }}"
+          if [ -n "$RUN_ID" ]; then
+            echo "🔁 RESUMING from run #${RUN_ID} (chain run ${RUN_COUNT})"
+          else
+            echo "🆕 NEW SCAN — URL: ${{ github.event.inputs.base_url }}"
+          fi
 
       - uses: actions/setup-python@v5
         with:
@@ -108,26 +130,115 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Download checkpoint from previous run
+        if: github.event.inputs.resume_from_run_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID="${{ github.event.inputs.resume_from_run_id }}"
+          echo "📥 Downloading checkpoint artifact from run ${RUN_ID}..."
+          mkdir -p ./checkpoint
+          gh run download "${RUN_ID}" \
+            --repo "${{ github.repository }}" \
+            --name "crawl-checkpoint" \
+            --dir ./checkpoint || {
+            echo "❌ Failed to download checkpoint from run ${RUN_ID}"
+            exit 1
+          }
+          ls -lh ./checkpoint/
+          echo "✅ Checkpoint downloaded"
+
       - name: Run crawler
         env:
-          BASE_URL:       ${{ github.event.inputs.base_url }}
-          TARGET_PAGES:   ${{ github.event.inputs.target_pages || '' }}
-          SCAN_LABEL:     ${{ github.event.inputs.scan_label || '' }}
-          MAX_DEPTH:      ${{ github.event.inputs.max_depth || '8' }}
-          MAX_PAGES:      ${{ github.event.inputs.max_pages || '3000' }}
-          CONCURRENCY:    ${{ github.event.inputs.concurrency || '10' }}
-          TIMEOUT:        '10'
-          POLITE_DELAY:   '0.3'
-          RESPECT_ROBOTS: 'true'
-          OUTPUT_DIR:     './reports'
+          BASE_URL:            ${{ github.event.inputs.base_url }}
+          TARGET_PAGES:        ${{ github.event.inputs.target_pages || '' }}
+          SCAN_LABEL:          ${{ github.event.inputs.scan_label || '' }}
+          MAX_DEPTH:           ${{ github.event.inputs.max_depth || '8' }}
+          MAX_PAGES:           ${{ github.event.inputs.max_pages || '0' }}
+          MAX_QUEUE:           ${{ github.event.inputs.max_queue || '20000' }}
+          CONCURRENCY:         ${{ github.event.inputs.concurrency || '10' }}
+          # Append any extra user-supplied trap patterns to the crawler defaults.
+          # The crawler reads TRAP_PATTERNS as comma-separated substrings.
+          # When extra_trap_patterns is blank the env var stays empty and the
+          # crawler falls back to its built-in Drupal-aware defaults.
+          TRAP_PATTERNS:       ${{ github.event.inputs.extra_trap_patterns || '' }}
+          TIMEOUT:             '10'
+          POLITE_DELAY:        '0.3'
+          RESPECT_ROBOTS:      'true'
+          OUTPUT_DIR:          './reports'
+          CRAWL_TIMEOUT_SECS:  '18000'
+          CHECKPOINT_IN:       ${{ github.event.inputs.resume_from_run_id != '' && './checkpoint/checkpoint.json' || '' }}
+          CHECKPOINT_OUT:      './reports/checkpoint.json'
+          RESUME_RUN_COUNT:    ${{ github.event.inputs.resume_run_count || '1' }}
         run: python crawler.py
 
-      - name: Verify reports
+      - name: Check if checkpoint was saved
+        id: check_checkpoint
         run: |
-          ls -lh reports/ || echo "⚠️ reports/ is empty or missing"
-          test -f reports/index.html && echo "✅ index.html found" || (echo "❌ index.html missing" && exit 1)
+          if [ -f reports/checkpoint_saved.txt ]; then
+            VAL=$(cat reports/checkpoint_saved.txt)
+          else
+            VAL="false"
+          fi
+          echo "checkpoint_saved=${VAL}" >> $GITHUB_OUTPUT
+          echo "Checkpoint saved: ${VAL}"
+
+      - name: Upload checkpoint artifact
+        if: steps.check_checkpoint.outputs.checkpoint_saved == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-checkpoint
+          path: reports/checkpoint.json
+          retention-days: 7
+
+      - name: Upload ZIP artifact (partial or final results)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: adhoc-run-${{ github.run_number }}-${{ github.event.inputs.scan_label || 'scan' }}
+          path: |
+            reports/*.html
+            reports/*.csv
+            reports/*.xlsx
+          retention-days: 30
+
+      - name: Auto-dispatch next run (chain)
+        if: steps.check_checkpoint.outputs.checkpoint_saved == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEXT_COUNT=$(( ${{ github.event.inputs.resume_run_count || '1' }} + 1 ))
+          echo "🚀 Checkpoint saved — auto-dispatching chain run ${NEXT_COUNT}..."
+          gh workflow run crawl.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref }}" \
+            --field "base_url=${{ github.event.inputs.base_url }}" \
+            --field "scan_mode=${{ github.event.inputs.scan_mode }}" \
+            --field "target_pages=${{ github.event.inputs.target_pages }}" \
+            --field "scan_label=${{ github.event.inputs.scan_label }}" \
+            --field "max_depth=${{ github.event.inputs.max_depth }}" \
+            --field "max_pages=${{ github.event.inputs.max_pages }}" \
+            --field "concurrency=${{ github.event.inputs.concurrency }}" \
+            --field "resume_from_run_id=${{ github.run_id }}" \
+            --field "resume_run_count=${NEXT_COUNT}"
+          echo "✅ Chain run ${NEXT_COUNT} dispatched — this run is complete"
+
+      # ── Steps below only run on the FINAL run (no checkpoint saved) ──────────
+
+      - name: Include archive in Pages deployment
+        if: steps.check_checkpoint.outputs.checkpoint_saved != 'true'
+        run: |
+          if git fetch origin gh-pages 2>/dev/null; then
+            mkdir -p reports/archive
+            git checkout origin/gh-pages -- archive/ 2>/dev/null || true
+            cp -r archive/. reports/archive/ 2>/dev/null || true
+            echo "✅ Archive included in Pages deployment"
+          else
+            echo "No gh-pages branch yet — skipping archive copy"
+          fi
 
       - name: Archive report to gh-pages
+        if: steps.check_checkpoint.outputs.checkpoint_saved != 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -142,10 +253,10 @@ jobs:
             cd -
           fi
           mkdir -p /tmp/gh-pages/archive/adhoc
-          # Only archive HTML to gh-pages (CSV/Excel too large for git)
           for f in reports/*.html; do
+            [ "$f" = "reports/index.html" ] && continue
             size=$(stat -c%s "$f" 2>/dev/null || echo 0)
-            if [ "$size" -lt 52428800 ]; then  # skip files >50MB
+            if [ "$size" -lt 52428800 ]; then
               cp "$f" /tmp/gh-pages/archive/adhoc/
             else
               echo "Skipping $f — too large (${size} bytes)"
@@ -181,41 +292,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload ZIP artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: adhoc-${{ github.event.inputs.scan_label || github.run_number }}
-          path: |
-            reports/*.html
-            reports/*.csv
-            reports/*.xlsx
-          retention-days: 30
-
-      - name: Include archive in Pages deployment
-        run: |
-          # Pull archive folder from gh-pages branch into reports/ so
-          # the full archive is accessible at the GitHub Pages URL
-          if git fetch origin gh-pages 2>/dev/null; then
-            mkdir -p reports/archive
-            git checkout origin/gh-pages -- archive/ 2>/dev/null || true
-            cp -r archive/. reports/archive/ 2>/dev/null || true
-            echo "✅ Archive included in Pages deployment"
-          else
-            echo "No gh-pages branch yet — skipping archive copy"
-          fi
-
       - name: Upload to GitHub Pages
+        if: steps.check_checkpoint.outputs.checkpoint_saved != 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./reports
 
       - name: Deploy to GitHub Pages
+        if: steps.check_checkpoint.outputs.checkpoint_saved != 'true'
         id: deployment
         uses: actions/deploy-pages@v4
 
       - name: Read crawl stats
-        if: always()
+        if: steps.check_checkpoint.outputs.checkpoint_saved != 'true' && always()
         id: stats
         run: |
           if [ -f reports/summary.json ]; then
@@ -233,11 +322,12 @@ jobs:
           print('EXTERNAL=' + str(s['external']))
           print('DURATION=' + str(s['duration']))
           print('RUN_DATE=' + str(s['run_date']))
+          print('RUN_COUNT='+ str(s.get('run_count', 1)))
           " >> $GITHUB_OUTPUT
           fi
 
-      - name: Send email
-        if: always()
+      - name: Send email (final run only)
+        if: steps.check_checkpoint.outputs.checkpoint_saved != 'true' && always()
         uses: dawidd6/action-send-mail@v4
         with:
           server_address: smtp.gmail.com
@@ -251,10 +341,11 @@ jobs:
           convert_markdown: false
           body: |
             Broken Link Report
-            Site:     ${{ github.event.inputs.base_url }}
-            Mode:     ${{ github.event.inputs.scan_mode }}
-            Run Date: ${{ steps.stats.outputs.RUN_DATE }}
-            Duration: ${{ steps.stats.outputs.DURATION }}
+            Site:      ${{ github.event.inputs.base_url }}
+            Mode:      ${{ github.event.inputs.scan_mode }}
+            Run Date:  ${{ steps.stats.outputs.RUN_DATE }}
+            Duration:  ${{ steps.stats.outputs.DURATION }}
+            Chain Runs: ${{ steps.stats.outputs.RUN_COUNT }}
 
             ══════════════════════════════════════════
               CRAWL RESULTS
@@ -287,7 +378,14 @@ jobs:
       - name: Write job summary
         if: always()
         run: |
-          echo "## 🔍 Ad-Hoc Crawl Complete" >> $GITHUB_STEP_SUMMARY
+          CKPT="${{ steps.check_checkpoint.outputs.checkpoint_saved }}"
+          if [ "$CKPT" = "true" ]; then
+            echo "## ⏸️ Checkpoint Saved — Chain Run ${{ github.event.inputs.resume_run_count || '1' }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Crawl paused at 5h45m. Next run auto-dispatched and will resume automatically." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ✅ Ad-Hoc Crawl Complete" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| | Link |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY

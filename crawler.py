@@ -11,6 +11,7 @@ Usage:
 import asyncio
 import aiohttp
 import csv
+import signal
 import json
 import os
 import sys
@@ -48,9 +49,18 @@ CONFIG = {
     "RESPECT_ROBOTS":  os.getenv("RESPECT_ROBOTS", "true").lower() == "true",
     "OUTPUT_DIR":      os.getenv("OUTPUT_DIR",  "./reports"),
     "USER_AGENT":      "Mozilla/5.0 (compatible; SiteCrawler/1.0; +https://github.com/your-repo)",
-    # Query params to strip when normalising URLs (avoid infinite pagination traps)
+    # Query params to strip when normalising URLs (avoid infinite pagination traps).
+    # Drupal additions: search_api_* and f[] are the faceted-search params that
+    # generate tens-of-thousands of near-duplicate URLs on Drupal Search API,
+    # Views, and Media Library pages.  Stripping them collapses all variants of
+    # a search page to a single canonical URL so the queue never explodes.
     "STRIP_PARAMS":    {"utm_source","utm_medium","utm_campaign","utm_content",
-                        "utm_term","sessionid","PHPSESSID","sid","ref"},
+                        "utm_term","sessionid","PHPSESSID","sid","ref",
+                        # Drupal Search API / Views / Media Library facets
+                        "search_api_fulltext","search_api_page","search_api_sort",
+                        "f","page","sort_by","sort_order","items_per_page",
+                        # Drupal core pager / language negotiation
+                        "delta","langcode"},
     # File extensions to skip parsing (still HEAD-check, just don't crawl for more links)
     "SKIP_PARSE_EXTS": {".pdf",".zip",".docx",".xlsx",".pptx",".exe",".dmg",
                         ".mp4",".mp3",".avi",".mov",".jpg",".jpeg",".png",
@@ -59,23 +69,46 @@ CONFIG = {
     "SKIP_SCHEMES":    {"mailto","tel","javascript","data","ftp","sms","callto"},
 
     # ── Queue explosion guard ──────────────────────────────────────────────
-    # Hard cap on queue size. Tag/category/pagination pages on WordPress and
-    # similar CMSes can push the queue to 30,000+ entries. When this cap is
-    # hit new URLs are silently dropped — already-queued pages still run.
-    "MAX_QUEUE":   int(os.getenv("MAX_QUEUE", "100000")),  # raised — 5000 was silently dropping pages
+    # Hard cap on queue size. Drupal search/facet/media-library pages can
+    # push the queue to 100 000+. Lowered to 20 000 — plenty for most sites.
+    # When the cap is hit new URLs are dropped; already-queued pages still run.
+    "MAX_QUEUE":   int(os.getenv("MAX_QUEUE", "20000")),
 
     # URL path fragments that signal crawl-trap pages.
     # URLs containing any of these strings will NOT be added to the crawl
     # queue (their HTTP status is still HEAD-checked once as a link).
     # Override via env var TRAP_PATTERNS as comma-separated strings.
+    #
+    # Drupal-specific additions:
+    #   /media-library   — Drupal Media Library browser (image 1): generates
+    #                      thousands of facet/filter URL permutations
+    #   /search          — Drupal search result pages (/search, /search?…)
+    #   search_api_      — residual Search API facet URLs not caught by STRIP_PARAMS
+    #   /views/ajax      — Drupal Views AJAX endpoint (not real pages)
+    #   /jsonapi/        — Drupal JSON:API (data endpoint, not web pages)
+    #   /node/           — raw node IDs (alias pages are crawled instead)
+    #   /files/          — managed-file directory: PDFs/docs HEAD-checked as
+    #                      links but NEVER crawled (handled by is_doc_url())
     "TRAP_PATTERNS": set(
         os.getenv("TRAP_PATTERNS",
             "/page/,/tag/,/tags/,/category/,/categories/,"
             "/author/,/feed/,/rss/,/wp-json/,/wp-admin/,"
             "/search/,/?s=,/?p=,/paged=,/archive/,/archives/,"
-            "/?query=,/?q=,/page="
+            "/?query=,/?q=,/page=,"
+            # Drupal-specific traps
+            "/media-library,/search?,search_api_,"
+            "/views/ajax,/jsonapi/,/node/"
         ).split(",")
     ),
+
+    # ── Document extensions: HEAD-check only, never crawl ─────────────────
+    # Every URL ending in one of these extensions (or whose path contains
+    # /files/) is verified via HEAD request to confirm the file exists, but
+    # is NEVER added to the crawl queue for link-extraction.  This prevents
+    # the crawler from "opening" PDFs and other binary files on Drupal sites.
+    "DOC_EXTS": {".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",
+                ".odt",".ods",".odp",".zip",".tar",".gz",".7z",".rar",
+                ".exe",".dmg",".pkg",".deb",".rpm"},
 
     # ── Targeted page scan ────────────────────────────────────────────────
     # Comma-separated list of specific page URLs to scan.
@@ -90,6 +123,14 @@ CONFIG = {
 
     # Optional label shown in the report header for targeted scans
     "SCAN_LABEL": os.getenv("SCAN_LABEL", ""),
+
+    # ── Checkpoint / resume ───────────────────────────────────────────────────
+    # CRAWL_TIMEOUT_SECS: stop after N seconds and save checkpoint for next run.
+    # 0 = no limit (default for local/Mac use).
+    # GitHub Actions sets this to 20700 (5h45m) via the workflow env.
+    "CRAWL_TIMEOUT_SECS": int(os.getenv("CRAWL_TIMEOUT_SECS", "0")),
+    "CHECKPOINT_IN":  os.getenv("CHECKPOINT_IN",  ""),   # path to resume from
+    "CHECKPOINT_OUT": os.getenv("CHECKPOINT_OUT", ""),   # path to save to on timeout
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -157,9 +198,31 @@ def is_same_domain(url: str, base: str) -> bool:
 
 
 def should_skip_parse(url: str) -> bool:
-    """True if the URL points to a binary file we should not parse for links."""
+    """True if the URL points to a binary/document file we should not parse for links."""
     path = urlparse(url).path.lower()
-    return any(path.endswith(ext) for ext in CONFIG["SKIP_PARSE_EXTS"])
+    all_skip = CONFIG["SKIP_PARSE_EXTS"] | CONFIG.get("DOC_EXTS", set())
+    return any(path.endswith(ext) for ext in all_skip)
+
+
+def is_doc_url(url: str) -> bool:
+    """
+    True for document / binary URLs that should be HEAD-checked to verify
+    the file exists but must NEVER be added to the crawl queue.
+
+    Covers two Drupal patterns:
+      1. Any URL whose path contains /files/  (Drupal managed-file directory)
+      2. Any URL whose extension is in DOC_EXTS  (.pdf, .docx, …)
+
+    Why a separate function instead of reusing should_skip_parse()?
+    should_skip_parse() also covers images/fonts/media that we do want to
+    include in the crawl queue as pages (e.g. a page that *happens* to end
+    in .jpg is rare but possible). is_doc_url() is specifically about files
+    that live in managed-file directories and must only be HEAD-checked.
+    """
+    path = urlparse(url).path.lower()
+    if "/files/" in path:
+        return True
+    return any(path.endswith(ext) for ext in CONFIG.get("DOC_EXTS", set()))
 
 
 # ──────────────────────────────────────────────
@@ -220,25 +283,37 @@ def status_category(status) -> str:
 async def fetch_page_html(session: aiohttp.ClientSession, url: str) -> tuple[int, str, str]:
     """
     GET a page. Returns (status_code, html_text, final_url_after_redirects).
+    Retries up to 2 times on Timeout so a single slow response does not
+    cause an entire section of the site to go undiscovered.
     """
     headers = {"User-Agent": CONFIG["USER_AGENT"]}
     timeout = aiohttp.ClientTimeout(total=CONFIG["TIMEOUT"])
-    try:
-        async with session.get(url, headers=headers, timeout=timeout,
-                               allow_redirects=True, ssl=False) as resp:
-            try:
-                html = await resp.text(errors="ignore")
-            except Exception:
-                html = ""
-            return resp.status, html, str(resp.url)
-    except asyncio.TimeoutError:
-        return "Timeout", "", url
-    except aiohttp.ClientSSLError as e:
-        return f"SSL Error", "", url
-    except aiohttp.ClientConnectorError as e:
-        return f"Connection Error", "", url
-    except Exception as e:
-        return f"Error: {type(e).__name__}", "", url
+    max_attempts = 3  # 1 initial + 2 retries
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with session.get(url, headers=headers, timeout=timeout,
+                                   allow_redirects=True, ssl=False) as resp:
+                try:
+                    html = await resp.text(errors="ignore")
+                except Exception:
+                    html = ""
+                return resp.status, html, str(resp.url)
+        except asyncio.TimeoutError:
+            if attempt < max_attempts:
+                log.debug("Timeout on attempt %d/%d for %s — retrying",
+                          attempt, max_attempts, url[:80])
+                await asyncio.sleep(1 * attempt)  # back off 1s, then 2s
+                continue
+            log.debug("Timeout after %d attempts: %s", max_attempts, url[:80])
+            return "Timeout", "", url
+        except aiohttp.ClientSSLError:
+            return "SSL Error", "", url
+        except aiohttp.ClientConnectorError:
+            return "Connection Error", "", url
+        except Exception as e:
+            return f"Error: {type(e).__name__}", "", url
+    return "Timeout", "", url  # unreachable but satisfies type checker
 
 
 async def check_link_status(session: aiohttp.ClientSession,
@@ -460,50 +535,121 @@ def safe_enqueue(queue: deque, seen: set, url: str, depth: int) -> bool:
     """
     Add a URL to the crawl queue only when ALL conditions are met:
       1. Not already seen (visited or previously queued)
-      2. Queue is below MAX_QUEUE hard cap
-      3. Not a trap URL pattern
-      4. Not a binary/skip-parse extension
-    Returns True if the URL was queued.
+      2. Depth is within MAX_DEPTH limit
+      3. Queue is below MAX_QUEUE hard cap
+      4. Not a trap URL pattern
+      5. Not a binary/skip-parse extension
+
+    IMPORTANT: URLs beyond MAX_DEPTH are rejected WITHOUT being added to `seen`.
+    This prevents depth-locking: if Page X is first discovered at depth 9 (over
+    limit) it stays out of `seen`, so when found again at depth 2 it can be
+    queued and crawled normally.
     """
     if url in seen:
         return False
+    if depth > CONFIG["MAX_DEPTH"]:
+        return False          # do NOT add to seen — allow shallower re-discovery
     if len(queue) >= CONFIG["MAX_QUEUE"]:
-        log.warning("MAX_QUEUE cap (%d) reached — URL silently dropped: %s",
+        log.warning("MAX_QUEUE cap (%d) reached — URL dropped: %s",
                     CONFIG["MAX_QUEUE"], url[:80])
         return False
     if is_trap_url(url):
         return False
     if should_skip_parse(url):
         return False
+    # Document/binary files in /files/ or with document extensions are
+    # verified as links (HEAD-checked) but must NEVER be crawled for more links.
+    if is_doc_url(url):
+        return False
     seen.add(url)
     queue.append((url, depth))
     return True
 
 
-async def crawl() -> list[dict]:
+async def crawl() -> tuple[list[dict], bool]:
+    """
+    Returns (results, checkpoint_saved).
+    checkpoint_saved=True means the crawl was paused and state saved to
+    CHECKPOINT_OUT — the caller should NOT deploy to Pages or send a
+    final email, and should trigger the next chained run instead.
+
+    Graceful shutdown: pressing Ctrl-C (SIGINT) or sending SIGTERM sets an
+    internal flag.  The current batch finishes, then the crawler writes
+    whatever results it has collected so far and exits normally — so you
+    always get a report even when you stop a long local run mid-way.
+    """
     base_url = CONFIG["BASE_URL"].rstrip("/")
     sem      = asyncio.Semaphore(CONFIG["CONCURRENCY"])
 
-    # `seen` tracks both visited pages AND queued-but-not-yet-visited pages.
-    # This is the key fix: previously only visited_pages was checked, so the
-    # queue would grow to 33k+ with the same URLs added repeatedly by
-    # concurrent async tasks before any of them were dequeued.
-    visited_pages: set[str] = set()   # pages whose HTML has been fetched
-    seen:          set[str] = set()   # visited + queued (dedup guard)
-    link_cache:    dict     = {}      # url -> (status, final_url) cache
-    results:       list[dict] = []
-    trap_skipped:  int      = 0       # counter for reporting
+    # ── Graceful shutdown via Ctrl-C or SIGTERM ───────────────────────────
+    _shutdown = asyncio.Event()
+
+    def _request_shutdown(sig_name: str):
+        if not _shutdown.is_set():
+            log.warning(
+                "⚠️  %s received — finishing current batch then writing "
+                "partial report…", sig_name)
+            _shutdown.set()
+
+    _loop = asyncio.get_event_loop()
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            _loop.add_signal_handler(_sig,
+                lambda s=_sig.name: _request_shutdown(s))
+        except (NotImplementedError, ValueError):
+            pass  # Windows / unsupported environments
+
+    visited_pages:   set[str]   = set()  # pages whose HTML fetch was started
+    completed_pages: set[str]   = set()  # pages fully processed (all links checked)
+    seen:            set[str]   = set()  # visited + queued (dedup guard)
+    link_cache:      dict       = {}     # url -> (status, final_url, ms) cache
+    results:         list[dict] = []
+    trap_skipped:    int        = 0
+    prior_run_count: int        = 0      # number of chained runs before this one
+
+    # ── Load checkpoint if resuming ───────────────────────────────────────────
+    checkpoint_in = CONFIG["CHECKPOINT_IN"]
+    if checkpoint_in and Path(checkpoint_in).exists():
+        log.info("📂 Loading checkpoint: %s", checkpoint_in)
+        with open(checkpoint_in) as f:
+            ckpt = json.load(f)
+        visited_pages   = set(ckpt["visited_pages"])
+        completed_pages = set(ckpt["completed_pages"])
+        seen            = set(ckpt["seen"])
+        link_cache      = {k: tuple(v) for k, v in ckpt["link_cache"].items()}
+        results         = ckpt["results"]
+        trap_skipped    = ckpt["trap_skipped"]
+        prior_run_count = ckpt.get("run_count", 1)
+        queue_data      = ckpt["queue"]
+        # Pages that were in-progress (visited but not completed) go back to queue
+        interrupted = visited_pages - completed_pages
+        if interrupted:
+            log.info("♻️  Re-queuing %d interrupted pages (were in-progress at cutoff)",
+                     len(interrupted))
+            for url in sorted(interrupted):
+                seen.discard(url)
+                visited_pages.discard(url)
+        queue: deque[tuple[str, int]] = deque(
+            (url, depth) for url, depth in queue_data
+        )
+        log.info("✅ Checkpoint loaded: %d visited, %d completed, %d queued, "
+                 "%d cached links, %d results so far",
+                 len(visited_pages), len(completed_pages),
+                 len(queue), len(link_cache), len(results))
+    else:
+        rp = load_robots(base_url)
+        start = normalize(base_url)
+        if not start:
+            log.error("BASE_URL '%s' is invalid.", base_url)
+            return [], False
+        queue: deque[tuple[str, int]] = deque()
+        seen.add(start)
+        queue.append((start, 0))
 
     rp = load_robots(base_url)
-
-    start = normalize(base_url)
-    if not start:
-        log.error("BASE_URL '%s' is invalid.", base_url)
-        return []
-
-    queue: deque[tuple[str, int]] = deque()
-    seen.add(start)
-    queue.append((start, 0))
+    crawl_start    = time.time()
+    timeout_secs   = CONFIG["CRAWL_TIMEOUT_SECS"]
+    checkpoint_saved = False
 
     connector = aiohttp.TCPConnector(
         limit=CONFIG["CONCURRENCY"] + 5,
@@ -515,10 +661,48 @@ async def crawl() -> list[dict]:
     async with aiohttp.ClientSession(connector=connector) as session:
 
         while queue:
+            # ── Graceful shutdown: Ctrl-C / SIGTERM ───────────────────────
+            if _shutdown.is_set():
+                log.warning(
+                    "Shutdown flag set — stopping crawl loop. "
+                    "Writing partial report (%d results so far).", len(results))
+                break
+
             # ── Hard stop: MAX_PAGES reached ──────────────────────────────
             if CONFIG["MAX_PAGES"] > 0 and len(visited_pages) >= CONFIG["MAX_PAGES"]:
                 log.warning("MAX_PAGES cap (%d) reached — crawl complete.",
                             CONFIG["MAX_PAGES"])
+                break
+
+            # ── Timeout check: save checkpoint and pause for next run ──────
+            if timeout_secs > 0 and (time.time() - crawl_start) >= timeout_secs:
+                elapsed_min = (time.time() - crawl_start) / 60
+                log.warning(
+                    "⏱️  Crawl timeout reached after %.1f min — saving checkpoint "
+                    "(%d pages done, %d queued). Next run will resume from here.",
+                    elapsed_min, len(completed_pages), len(queue))
+                checkpoint_out = CONFIG["CHECKPOINT_OUT"]
+                if checkpoint_out:
+                    ckpt = {
+                        "run_count":       prior_run_count + 1,
+                        "base_url":        base_url,
+                        "visited_pages":   list(visited_pages),
+                        "completed_pages": list(completed_pages),
+                        "seen":            list(seen),
+                        "queue":           list(queue),
+                        # link_cache values are tuples — serialise as lists
+                        "link_cache":      {k: list(v) for k, v in link_cache.items()},
+                        "results":         results,
+                        "trap_skipped":    trap_skipped,
+                        "saved_at":        now_est().strftime("%Y-%m-%d %H:%M:%S %Z"),
+                    }
+                    Path(checkpoint_out).parent.mkdir(parents=True, exist_ok=True)
+                    with open(checkpoint_out, "w") as f:
+                        json.dump(ckpt, f)
+                    log.info("💾 Checkpoint saved → %s  (%.1f MB)",
+                             checkpoint_out,
+                             Path(checkpoint_out).stat().st_size / 1_048_576)
+                    checkpoint_saved = True
                 break
 
             # ── Build next batch ──────────────────────────────────────────
@@ -544,13 +728,6 @@ async def crawl() -> list[dict]:
                      len(queue), trap_skipped)
 
             # ── Process each page in the batch concurrently ───────────────
-            # batch_candidates collects ALL new URLs discovered across ALL pages
-            # in this batch. We populate it during the concurrent gather, then
-            # sort + enqueue AFTER all pages finish — making every run
-            # deterministic regardless of which page's HTTP response arrived first.
-            batch_candidates: list[tuple[str, int]] = []
-            batch_trap_count = 0
-
             async def process_page(page_url: str, depth: int):
                 nonlocal trap_skipped
 
@@ -584,7 +761,7 @@ async def crawl() -> list[dict]:
 
                 # ── Check every link on this page (concurrent, cached) ────
                 async def check_one(link_url: str, link_text: str):
-                    nonlocal batch_trap_count
+                    nonlocal trap_skipped
                     async with sem:
                         lnk_status, lnk_final, lnk_load_ms = await check_link_status(
                             session, link_url, link_cache)
@@ -614,35 +791,32 @@ async def crawl() -> list[dict]:
                     if CONFIG["MAX_PAGES"] > 0 and len(visited_pages) >= CONFIG["MAX_PAGES"]:
                         return  # hard page cap — stop queueing
 
-                    # Trap-pattern check — count here, enqueue decision made later
+                    # Trap-pattern check with counter for reporting
                     if is_trap_url(link_url):
-                        batch_trap_count += 1
+                        trap_skipped += 1
                         return
 
-                    # Collect into batch-level list — NOT into queue yet
-                    batch_candidates.append((link_url, depth + 1))
+                    # Enqueue immediately — safe_enqueue deduplicates via seen set
+                    safe_enqueue(queue, seen, link_url, depth + 1)
 
                 await asyncio.gather(
                     *[check_one(lu, lt) for lu, lt in page_links])
 
             await asyncio.gather(*[process_page(u, d) for u, d in batch])
 
-            # ── Deterministic enqueue: sort ALL candidates from the whole batch
-            # by (depth, url) so every run explores in the same order,
-            # regardless of which page's network response arrived first.
-            trap_skipped += batch_trap_count
-            for eq_url, eq_depth in sorted(batch_candidates,
-                                           key=lambda x: (x[1], x[0])):
-                safe_enqueue(queue, seen, eq_url, eq_depth)
+            # Mark all pages in this batch as fully completed
+            for page_url, _ in batch:
+                completed_pages.add(page_url)
 
             if CONFIG["POLITE_DELAY"] > 0:
                 await asyncio.sleep(CONFIG["POLITE_DELAY"])
 
     log.info(
-        "Crawl complete. visited=%d  results=%d  trap-skipped=%d  "
-        "queue-remaining=%d",
-        len(visited_pages), len(results), trap_skipped, len(queue))
-    return results
+        "Crawl complete. visited=%d  completed=%d  results=%d  "
+        "trap-skipped=%d  queue-remaining=%d",
+        len(visited_pages), len(completed_pages),
+        len(results), trap_skipped, len(queue))
+    return results, checkpoint_saved
 
 
 # ──────────────────────────────────────────────
@@ -1458,9 +1632,10 @@ async def main():
     if scan_mode == "targeted":
         log.info("Mode: TARGETED — %d page(s) specified", len(target_pages))
         results = await targeted_crawl(target_pages)
+        checkpoint_saved = False
     else:
         log.info("Mode: FULL CRAWL — starting from %s", CONFIG["BASE_URL"])
-        results = await crawl()
+        results, checkpoint_saved = await crawl()
 
     output_dir = Path(CONFIG["OUTPUT_DIR"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1561,10 +1736,21 @@ async def main():
         "internal":      internal,
         "external":      external,
     }
+    summary_data["checkpoint_saved"] = checkpoint_saved
+    summary_data["run_count"] = int(os.getenv("RESUME_RUN_COUNT", "1"))
     summary_path = str(output_dir / "summary.json")
     with open(summary_path, "w", encoding="utf-8") as sf:
         json.dump(summary_data, sf, indent=2)
     log.info("summary.json written → %s", summary_path)
+
+    # Write flag file so the workflow knows whether to chain another run
+    flag_path = str(output_dir / "checkpoint_saved.txt")
+    with open(flag_path, "w") as ff:
+        ff.write("true" if checkpoint_saved else "false")
+    if checkpoint_saved:
+        log.info("🔁 checkpoint_saved.txt = true — workflow will auto-dispatch next run")
+    else:
+        log.info("✅ checkpoint_saved.txt = false — this was the final run")
 
     if os.getenv("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as gf:
