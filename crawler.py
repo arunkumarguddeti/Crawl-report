@@ -606,8 +606,19 @@ def safe_enqueue(queue: deque, seen: set, url: str, depth: int) -> bool:
     if depth > CONFIG["MAX_DEPTH"]:
         return False          # NOT added to seen — allow shallower re-discovery
     if len(queue) >= CONFIG["MAX_QUEUE"]:
-        log.warning("MAX_QUEUE cap (%d) reached — URL dropped: %s",
-                    CONFIG["MAX_QUEUE"], url[:80])
+        # Add to seen so this URL is never re-attempted — prevents re-discovery
+        # spam from the same URL being found on many different pages.
+        seen.add(url)
+        if not getattr(safe_enqueue, "_cap_warned", False):
+            log.warning(
+                "⚠️  MAX_QUEUE cap (%d) reached — new URLs will be dropped until "
+                "the queue drains. Increase MAX_QUEUE to include them, or use "
+                "the dropped_pages.txt from the report as TARGET_PAGES next run.",
+                CONFIG["MAX_QUEUE"])
+            safe_enqueue._cap_warned = True
+        if not hasattr(safe_enqueue, "_dropped_urls"):
+            safe_enqueue._dropped_urls = []
+        safe_enqueue._dropped_urls.append(url)
         return False
     if is_trap_url(url):
         return False
@@ -1009,12 +1020,22 @@ async def crawl() -> tuple[list[dict], bool]:
                              _delay)
                 await asyncio.sleep(_delay)
 
+    dropped_urls = getattr(safe_enqueue, "_dropped_urls", [])
+    dropped = len(dropped_urls)
+    if dropped:
+        log.warning(
+            "⚠️  MAX_QUEUE summary: %d URLs were dropped (queue cap=%d). "
+            "dropped_pages.txt in the report lists them all for targeted re-scan.",
+            dropped, CONFIG["MAX_QUEUE"])
+    # Reset for any future calls
+    safe_enqueue._cap_warned = False
+    safe_enqueue._dropped_urls = []
     log.info(
         "Crawl complete. visited=%d  completed=%d  results=%d  "
-        "trap-skipped=%d  queue-remaining=%d",
+        "trap-skipped=%d  queue-dropped=%d  queue-remaining=%d",
         len(visited_pages), len(completed_pages),
-        len(results), trap_skipped, len(queue))
-    return results, checkpoint_saved
+        len(results), trap_skipped, dropped, len(queue))
+    return results, checkpoint_saved, dropped_urls
 
 
 # ──────────────────────────────────────────────
@@ -1118,6 +1139,41 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
 
     else:
         targeted_info_html = ""
+
+    # Build dropped pages banner if any URLs were dropped due to MAX_QUEUE cap
+    dropped_urls = dropped_urls or []
+    if dropped_urls:
+        seen_d = set()
+        unique_d = [u for u in dropped_urls if not (u in seen_d or seen_d.add(u))]
+        dropped_csv = ",".join(unique_d[:500])
+        more_note = f" (showing first 500 of {len(unique_d):,})" if len(unique_d) > 500 else ""
+        dropped_rows_html = "".join(
+            f'<tr><td><a href="{u}" target="_blank" style="color:#93c5fd">{u}</a></td></tr>'
+            for u in unique_d[:500]
+        )
+        dropped_info_html = (
+            '<div style="background:#1e293b;border:1px solid #f59e0b;' +
+            'border-radius:10px;padding:14px 18px;margin-bottom:18px">' +
+            f'<div style="font-weight:700;color:#fbbf24;margin-bottom:8px;font-size:15px">' +
+            f'⚠️ {len(unique_d):,} pages were NOT crawled — MAX_QUEUE cap reached{more_note}</div>' +
+            '<p style="color:#94a3b8;font-size:13px;margin-bottom:10px">These pages were discovered ' +
+            'but the queue was full. Paste the list below into <b>TARGET_PAGES</b> for a new targeted scan. ' +
+            'The full list is also in <b>dropped_pages.txt</b> in the ZIP artifact.</p>' +
+            '<div style="background:#0f172a;border-radius:6px;padding:10px;margin-bottom:10px">' +
+            '<div style="color:#64748b;font-size:11px;margin-bottom:6px">▼ Comma-separated — paste into TARGET_PAGES</div>' +
+            f'<textarea readonly onclick="this.select()" style="width:100%;height:80px;background:#0f172a;' +
+            'color:#a3e635;border:1px solid #334155;border-radius:4px;padding:8px;font-size:11px;' +
+            f'font-family:monospace;resize:vertical">{dropped_csv}</textarea></div>' +
+            f'<details style="cursor:pointer"><summary style="color:#94a3b8;font-size:13px">' +
+            f'Show all {len(unique_d):,} dropped URLs</summary>' +
+            '<div style="max-height:300px;overflow-y:auto;margin-top:8px">' +
+            '<table style="width:100%;border-collapse:collapse"><thead><tr>' +
+            '<th style="background:#1e293b;padding:6px 10px;text-align:left;' +
+            'color:#94a3b8;font-size:11px;border-bottom:1px solid #334155">Page URL</th>' +
+            f'</tr></thead><tbody style="font-size:12px">{dropped_rows_html}</tbody></table></div></details></div>'
+        )
+    else:
+        dropped_info_html = ""
 
     def row_class(status):
         s = str(status)
@@ -1299,6 +1355,7 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
 <div class="container">
 
 {targeted_info_html}
+{dropped_info_html}
   <div class="cards">
     <div class="card c-white"  onclick="cardFilter('')"          id="card-all">     <div class="val">{total_pages:,}</div><div class="lbl">Parent Pages</div></div>
     <div class="card c-white"  onclick="cardFilter('')"          id="card-links">   <div class="val">{total_links:,}</div><div class="lbl">Total Links</div></div>
@@ -1851,9 +1908,10 @@ async def main():
         log.info("Mode: TARGETED — %d page(s) specified", len(target_pages))
         results = await targeted_crawl(target_pages)
         checkpoint_saved = False
+        dropped_urls = []
     else:
         log.info("Mode: FULL CRAWL — starting from %s", CONFIG["BASE_URL"])
-        results, checkpoint_saved = await crawl()
+        results, checkpoint_saved, dropped_urls = await crawl()
 
     output_dir = Path(CONFIG["OUTPUT_DIR"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1895,6 +1953,37 @@ async def main():
     await enrich_with_ips(results)
 
     write_csv(results, csv_path)
+
+    # Write dropped_pages.txt if any URLs were dropped due to MAX_QUEUE cap
+    dropped_path = str(output_dir / "dropped_pages.txt")
+    if dropped_urls:
+        # Deduplicate while preserving order
+        seen_dropped = set()
+        unique_dropped = []
+        for u in dropped_urls:
+            if u not in seen_dropped:
+                seen_dropped.add(u)
+                unique_dropped.append(u)
+        with open(dropped_path, "w", encoding="utf-8") as dp:
+            dp.write("# Pages dropped due to MAX_QUEUE cap\n")
+            dp.write(f"# Total: {len(unique_dropped)} unique URLs\n")
+            dp.write("# To re-scan these pages, paste the comma-separated list\n")
+            dp.write("# below into TARGET_PAGES in a new targeted scan.\n")
+            dp.write("#\n")
+            dp.write("# ── Comma-separated (paste into TARGET_PAGES field) ──\n")
+            dp.write(",".join(unique_dropped) + "\n")
+            dp.write("#\n")
+            dp.write("# ── One per line ──\n")
+            for u in unique_dropped:
+                dp.write(u + "\n")
+        log.info("dropped_pages.txt → %s  (%d unique URLs)",
+                 dropped_path, len(unique_dropped))
+    else:
+        # Write empty file so workflow artifact always has it
+        with open(dropped_path, "w") as dp:
+            dp.write("# No pages were dropped — all discovered URLs fit within MAX_QUEUE.\n")
+        unique_dropped = []
+
     # Excel: write non-200 rows only (broken/redirect/error/timeout).
     # The HTML report now includes 200 OK rows with a hide/show toggle.
     # Excel is kept as the actionable broken-links list to stay under size limits.
@@ -1906,7 +1995,8 @@ async def main():
 
     html = build_html_report(results, csv_path, elapsed,
                              scan_mode=scan_mode,
-                             target_pages=target_pages)
+                             target_pages=target_pages,
+                             dropped_urls=unique_dropped)
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
     log.info("HTML report written → %s", html_path)
@@ -1931,6 +2021,9 @@ async def main():
     print(f"  200 OK     : {ok:,}")
     print(f"  Broken     : {broken:,}")
     print(f"  Duration   : {dur_str}")
+    if unique_dropped:
+        print(f"  ⚠️  Queue dropped: {len(unique_dropped):,} pages not crawled (MAX_QUEUE cap)")
+        print(f"  Dropped list : {dropped_path}")
     print(f"  Reports    : {csv_path}")
     print(f"              {html_path}")
     print(f"              {xlsx_path}")
@@ -1943,20 +2036,21 @@ async def main():
     internal   = sum(1 for r in results if r.get("link_type") == "Internal")
     external   = sum(1 for r in results if r.get("link_type") == "External")
     summary_data = {
-        "url":           CONFIG["BASE_URL"],
-        "mode":          mode_str,
-        "label":         label,
-        "run_date":      run_date,
-        "duration":      dur_str,
-        "pages":         pages_crawled,
-        "total_links":   len(results),
-        "ok":            ok,
-        "broken":        broken,
-        "redirects":     redirects,
-        "server_errors": srv_errors,
-        "timeouts":      timeouts,
-        "internal":      internal,
-        "external":      external,
+        "url":             CONFIG["BASE_URL"],
+        "mode":            mode_str,
+        "label":           label,
+        "run_date":        run_date,
+        "duration":        dur_str,
+        "pages":           pages_crawled,
+        "total_links":     len(results),
+        "ok":              ok,
+        "broken":          broken,
+        "redirects":       redirects,
+        "server_errors":   srv_errors,
+        "timeouts":        timeouts,
+        "internal":        internal,
+        "external":        external,
+        "queue_dropped":   len(unique_dropped),
     }
     summary_data["checkpoint_saved"] = checkpoint_saved
     summary_data["run_count"] = int(os.getenv("RESUME_RUN_COUNT", "1"))
