@@ -50,16 +50,13 @@ CONFIG = {
     "OUTPUT_DIR":      os.getenv("OUTPUT_DIR",  "./reports"),
     "USER_AGENT":      "Mozilla/5.0 (compatible; SiteCrawler/1.0; +https://github.com/your-repo)",
     # Query params to strip when normalising URLs (avoid infinite pagination traps).
-    # Drupal additions: search_api_* and f[] are the faceted-search params that
-    # generate tens-of-thousands of near-duplicate URLs on Drupal Search API,
-    # Views, and Media Library pages.  Stripping them collapses all variants of
-    # a search page to a single canonical URL so the queue never explodes.
+    # Drupal additions: search_api_* and f[] are faceted-search params that
+    # generate tens-of-thousands of near-duplicate URLs — stripping them
+    # collapses all variants to one canonical URL so the queue never explodes.
     "STRIP_PARAMS":    {"utm_source","utm_medium","utm_campaign","utm_content",
                         "utm_term","sessionid","PHPSESSID","sid","ref",
-                        # Drupal Search API / Views / Media Library facets
                         "search_api_fulltext","search_api_page","search_api_sort",
                         "f","page","sort_by","sort_order","items_per_page",
-                        # Drupal core pager / language negotiation
                         "delta","langcode"},
     # File extensions to skip parsing (still HEAD-check, just don't crawl for more links)
     "SKIP_PARSE_EXTS": {".pdf",".zip",".docx",".xlsx",".pptx",".exe",".dmg",
@@ -69,9 +66,8 @@ CONFIG = {
     "SKIP_SCHEMES":    {"mailto","tel","javascript","data","ftp","sms","callto"},
 
     # ── Queue explosion guard ──────────────────────────────────────────────
-    # Hard cap on queue size. Drupal search/facet/media-library pages can
-    # push the queue to 100 000+. Lowered to 20 000 — plenty for most sites.
-    # When the cap is hit new URLs are dropped; already-queued pages still run.
+    # Drupal Search API / Media Library pages generate 100 000+ near-duplicate
+    # URLs. Lowered cap to 20 000 — plenty for large sites, prevents runaway.
     "MAX_QUEUE":   int(os.getenv("MAX_QUEUE", "20000")),
 
     # URL path fragments that signal crawl-trap pages.
@@ -79,36 +75,36 @@ CONFIG = {
     # queue (their HTTP status is still HEAD-checked once as a link).
     # Override via env var TRAP_PATTERNS as comma-separated strings.
     #
-    # Drupal-specific additions:
-    #   /media-library   — Drupal Media Library browser (image 1): generates
-    #                      thousands of facet/filter URL permutations
-    #   /search          — Drupal search result pages (/search, /search?…)
-    #   search_api_      — residual Search API facet URLs not caught by STRIP_PARAMS
-    #   /views/ajax      — Drupal Views AJAX endpoint (not real pages)
-    #   /jsonapi/        — Drupal JSON:API (data endpoint, not web pages)
-    #   /node/           — raw node IDs (alias pages are crawled instead)
-    #   /files/          — managed-file directory: PDFs/docs HEAD-checked as
-    #                      links but NEVER crawled (handled by is_doc_url())
+    # NOTE: /node/ is intentionally NOT in this list — on Drupal sites,
+    # /node/123 is often the *primary* URL for real content pages.
+    # /jsonapi/ and /views/ajax are data endpoints, not pages.
+    # /media-library generates infinite facet URL permutations (see screenshots).
+    # /search? and search_api_ catch residual Search API URLs after param stripping.
     "TRAP_PATTERNS": set(
         os.getenv("TRAP_PATTERNS",
             "/page/,/tag/,/tags/,/category/,/categories/,"
             "/author/,/feed/,/rss/,/wp-json/,/wp-admin/,"
             "/search/,/?s=,/?p=,/paged=,/archive/,/archives/,"
             "/?query=,/?q=,/page=,"
-            # Drupal-specific traps
             "/media-library,/search?,search_api_,"
-            "/views/ajax,/jsonapi/,/node/"
+            "/views/ajax,/jsonapi/"
         ).split(",")
     ),
 
     # ── Document extensions: HEAD-check only, never crawl ─────────────────
-    # Every URL ending in one of these extensions (or whose path contains
-    # /files/) is verified via HEAD request to confirm the file exists, but
-    # is NEVER added to the crawl queue for link-extraction.  This prevents
-    # the crawler from "opening" PDFs and other binary files on Drupal sites.
+    # Every URL with one of these extensions (or path containing /files/) is
+    # verified via HEAD to confirm the file exists, but NEVER crawled for links.
     "DOC_EXTS": {".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",
                 ".odt",".ods",".odp",".zip",".tar",".gz",".7z",".rar",
                 ".exe",".dmg",".pkg",".deb",".rpm"},
+
+    # ── Rate-limit / politeness ───────────────────────────────────────────
+    # When the server returns 429 (Too Many Requests), the crawler pauses
+    # this many seconds before retrying.  Doubles on each consecutive 429
+    # up to RATE_LIMIT_MAX_WAIT.  Resets to RATE_LIMIT_BASE_WAIT after any
+    # successful response.
+    "RATE_LIMIT_BASE_WAIT": float(os.getenv("RATE_LIMIT_BASE_WAIT", "5.0")),
+    "RATE_LIMIT_MAX_WAIT":  float(os.getenv("RATE_LIMIT_MAX_WAIT",  "120.0")),
 
     # ── Targeted page scan ────────────────────────────────────────────────
     # Comma-separated list of specific page URLs to scan.
@@ -206,18 +202,9 @@ def should_skip_parse(url: str) -> bool:
 
 def is_doc_url(url: str) -> bool:
     """
-    True for document / binary URLs that should be HEAD-checked to verify
-    the file exists but must NEVER be added to the crawl queue.
-
-    Covers two Drupal patterns:
-      1. Any URL whose path contains /files/  (Drupal managed-file directory)
-      2. Any URL whose extension is in DOC_EXTS  (.pdf, .docx, …)
-
-    Why a separate function instead of reusing should_skip_parse()?
-    should_skip_parse() also covers images/fonts/media that we do want to
-    include in the crawl queue as pages (e.g. a page that *happens* to end
-    in .jpg is rare but possible). is_doc_url() is specifically about files
-    that live in managed-file directories and must only be HEAD-checked.
+    True for document/binary URLs that must be HEAD-checked (to verify the
+    file exists as a link) but NEVER added to the crawl queue.
+    Covers Drupal /files/ paths and DOC_EXTS extensions.
     """
     path = urlparse(url).path.lower()
     if "/files/" in path:
@@ -280,20 +267,55 @@ def status_category(status) -> str:
 #  ASYNC HTTP HELPERS
 # ──────────────────────────────────────────────
 
+# Shared mutable rate-limit state — increased by any worker that sees 429,
+# read by the crawl loop to insert extra inter-batch sleep.
+_rate_limit_wait: float = 0.0   # current extra wait seconds (0 = not rate-limited)
+_consecutive_429: int   = 0     # how many 429s in a row (drives exponential backoff)
+
+
+async def _handle_429(url: str) -> None:
+    """Exponential backoff when the server returns 429 Too Many Requests."""
+    global _rate_limit_wait, _consecutive_429
+    _consecutive_429 += 1
+    base  = CONFIG.get("RATE_LIMIT_BASE_WAIT", 5.0)
+    limit = CONFIG.get("RATE_LIMIT_MAX_WAIT",  120.0)
+    wait  = min(base * (2 ** (_consecutive_429 - 1)), limit)
+    _rate_limit_wait = wait
+    log.warning(
+        "🚦 429 Too Many Requests for %s — rate-limited. "
+        "Backing off %.0fs (attempt %d). "
+        "Stop all other terminal crawls if running multiple instances!",
+        url[:80], wait, _consecutive_429)
+    await asyncio.sleep(wait)
+
+
+def _reset_rate_limit() -> None:
+    """Call after any successful (non-429) response to reset backoff."""
+    global _rate_limit_wait, _consecutive_429
+    if _consecutive_429 > 0:
+        log.info("✅ Rate limit lifted — resuming normal crawl speed.")
+    _rate_limit_wait  = 0.0
+    _consecutive_429  = 0
+
+
 async def fetch_page_html(session: aiohttp.ClientSession, url: str) -> tuple[int, str, str]:
     """
     GET a page. Returns (status_code, html_text, final_url_after_redirects).
-    Retries up to 2 times on Timeout so a single slow response does not
-    cause an entire section of the site to go undiscovered.
+    Handles 429 Rate Limit with exponential backoff (up to RATE_LIMIT_MAX_WAIT).
+    Retries up to 2 times on Timeout.
     """
     headers = {"User-Agent": CONFIG["USER_AGENT"]}
     timeout = aiohttp.ClientTimeout(total=CONFIG["TIMEOUT"])
-    max_attempts = 3  # 1 initial + 2 retries
+    max_attempts = 3
 
     for attempt in range(1, max_attempts + 1):
         try:
             async with session.get(url, headers=headers, timeout=timeout,
                                    allow_redirects=True, ssl=False) as resp:
+                if resp.status == 429:
+                    await _handle_429(url)
+                    continue  # retry after backoff
+                _reset_rate_limit()
                 try:
                     html = await resp.text(errors="ignore")
                 except Exception:
@@ -303,9 +325,8 @@ async def fetch_page_html(session: aiohttp.ClientSession, url: str) -> tuple[int
             if attempt < max_attempts:
                 log.debug("Timeout on attempt %d/%d for %s — retrying",
                           attempt, max_attempts, url[:80])
-                await asyncio.sleep(1 * attempt)  # back off 1s, then 2s
+                await asyncio.sleep(1 * attempt)
                 continue
-            log.debug("Timeout after %d attempts: %s", max_attempts, url[:80])
             return "Timeout", "", url
         except aiohttp.ClientSSLError:
             return "SSL Error", "", url
@@ -313,7 +334,7 @@ async def fetch_page_html(session: aiohttp.ClientSession, url: str) -> tuple[int
             return "Connection Error", "", url
         except Exception as e:
             return f"Error: {type(e).__name__}", "", url
-    return "Timeout", "", url  # unreachable but satisfies type checker
+    return "Timeout", "", url
 
 
 async def check_link_status(session: aiohttp.ClientSession,
@@ -329,33 +350,48 @@ async def check_link_status(session: aiohttp.ClientSession,
     headers = {"User-Agent": CONFIG["USER_AGENT"]}
     timeout = aiohttp.ClientTimeout(total=CONFIG["TIMEOUT"])
     t0 = time.monotonic()
-    try:
-        async with session.head(url, headers=headers, timeout=timeout,
-                                allow_redirects=True, ssl=False) as resp:
-            load_ms = round((time.monotonic() - t0) * 1000)
-            if resp.status == 405:
-                raise aiohttp.ClientResponseError(
-                    resp.request_info, resp.history, status=405)
-            result = (resp.status, str(resp.url), load_ms)
-    except aiohttp.ClientResponseError:
-        t0 = time.monotonic()
+    for _attempt in range(3):
         try:
-            async with session.get(url, headers=headers, timeout=timeout,
-                                   allow_redirects=True, ssl=False) as resp:
+            async with session.head(url, headers=headers, timeout=timeout,
+                                    allow_redirects=True, ssl=False) as resp:
                 load_ms = round((time.monotonic() - t0) * 1000)
+                if resp.status == 429:
+                    await _handle_429(url)
+                    t0 = time.monotonic()
+                    continue
+                if resp.status == 405:
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=405)
+                _reset_rate_limit()
                 result = (resp.status, str(resp.url), load_ms)
+                break
+        except aiohttp.ClientResponseError:
+            t0 = time.monotonic()
+            try:
+                async with session.get(url, headers=headers, timeout=timeout,
+                                       allow_redirects=True, ssl=False) as resp:
+                    load_ms = round((time.monotonic() - t0) * 1000)
+                    if resp.status == 429:
+                        await _handle_429(url)
+                        t0 = time.monotonic()
+                        continue
+                    _reset_rate_limit()
+                    result = (resp.status, str(resp.url), load_ms)
+                    break
+            except asyncio.TimeoutError:
+                result = ("Timeout", url, -1); break
+            except Exception as e:
+                result = (f"Error: {type(e).__name__}", url, -1); break
         except asyncio.TimeoutError:
-            result = ("Timeout", url, -1)
+            result = ("Timeout", url, -1); break
+        except aiohttp.ClientSSLError:
+            result = ("SSL Error", url, -1); break
+        except aiohttp.ClientConnectorError:
+            result = ("Connection Error", url, -1); break
         except Exception as e:
-            result = (f"Error: {type(e).__name__}", url, -1)
-    except asyncio.TimeoutError:
-        result = ("Timeout", url, -1)
-    except aiohttp.ClientSSLError:
-        result = ("SSL Error", url, -1)
-    except aiohttp.ClientConnectorError:
-        result = ("Connection Error", url, -1)
-    except Exception as e:
-        result = (f"Error: {type(e).__name__}", url, -1)
+            result = (f"Error: {type(e).__name__}", url, -1); break
+    else:
+        result = ("Timeout", url, -1)  # all 3 attempts were 429 retries
 
     link_cache[url] = result
     return result
@@ -557,8 +593,7 @@ def safe_enqueue(queue: deque, seen: set, url: str, depth: int) -> bool:
         return False
     if should_skip_parse(url):
         return False
-    # Document/binary files in /files/ or with document extensions are
-    # verified as links (HEAD-checked) but must NEVER be crawled for more links.
+    # /files/ paths and document extensions: HEAD-check as links, never crawl.
     if is_doc_url(url):
         return False
     seen.add(url)
@@ -570,25 +605,22 @@ async def crawl() -> tuple[list[dict], bool]:
     """
     Returns (results, checkpoint_saved).
     checkpoint_saved=True means the crawl was paused and state saved to
-    CHECKPOINT_OUT — the caller should NOT deploy to Pages or send a
-    final email, and should trigger the next chained run instead.
-
-    Graceful shutdown: pressing Ctrl-C (SIGINT) or sending SIGTERM sets an
-    internal flag.  The current batch finishes, then the crawler writes
-    whatever results it has collected so far and exits normally — so you
-    always get a report even when you stop a long local run mid-way.
+    CHECKPOINT_OUT.  Ctrl-C / SIGTERM triggers graceful shutdown: the current
+    batch finishes, then full reports (CSV / Excel / HTML) are written from
+    whatever was collected — so you always get a usable report on early exit.
     """
     base_url = CONFIG["BASE_URL"].rstrip("/")
     sem      = asyncio.Semaphore(CONFIG["CONCURRENCY"])
 
-    # ── Graceful shutdown via Ctrl-C or SIGTERM ───────────────────────────
+    # ── Graceful shutdown (Ctrl-C or SIGTERM) ─────────────────────────────
     _shutdown = asyncio.Event()
 
     def _request_shutdown(sig_name: str):
         if not _shutdown.is_set():
             log.warning(
                 "⚠️  %s received — finishing current batch then writing "
-                "partial report…", sig_name)
+                "partial report with %d results collected so far…",
+                sig_name, len(results) if "results" in dir() else 0)
             _shutdown.set()
 
     _loop = asyncio.get_event_loop()
@@ -597,7 +629,7 @@ async def crawl() -> tuple[list[dict], bool]:
             _loop.add_signal_handler(_sig,
                 lambda s=_sig.name: _request_shutdown(s))
         except (NotImplementedError, ValueError):
-            pass  # Windows / unsupported environments
+            pass  # Windows
 
     visited_pages:   set[str]   = set()  # pages whose HTML fetch was started
     completed_pages: set[str]   = set()  # pages fully processed (all links checked)
@@ -664,8 +696,8 @@ async def crawl() -> tuple[list[dict], bool]:
             # ── Graceful shutdown: Ctrl-C / SIGTERM ───────────────────────
             if _shutdown.is_set():
                 log.warning(
-                    "Shutdown flag set — stopping crawl loop. "
-                    "Writing partial report (%d results so far).", len(results))
+                    "Shutdown requested — stopping after current batch. "
+                    "Writing partial report (%d results).", len(results))
                 break
 
             # ── Hard stop: MAX_PAGES reached ──────────────────────────────
@@ -808,8 +840,15 @@ async def crawl() -> tuple[list[dict], bool]:
             for page_url, _ in batch:
                 completed_pages.add(page_url)
 
-            if CONFIG["POLITE_DELAY"] > 0:
-                await asyncio.sleep(CONFIG["POLITE_DELAY"])
+            # ── Polite delay + adaptive rate-limit backoff ────────────────
+            base_delay = CONFIG["POLITE_DELAY"]
+            extra      = _rate_limit_wait  # set by _handle_429, reset on success
+            total_delay = max(base_delay, extra)
+            if total_delay > 0:
+                if extra > base_delay:
+                    log.info("⏳ Rate-limit cooldown: sleeping %.1fs between batches",
+                             total_delay)
+                await asyncio.sleep(total_delay)
 
     log.info(
         "Crawl complete. visited=%d  completed=%d  results=%d  "
