@@ -1062,7 +1062,8 @@ def write_csv(results: list[dict], path: str):
 # ──────────────────────────────────────────────
 
 def build_html_report(results: list[dict], csv_path: str, elapsed: float,
-                      scan_mode: str = "full", target_pages: list = None) -> str:
+                      scan_mode: str = "full", target_pages: list = None,
+                      dropped_urls: list = None) -> str:
 
     PAGE_SIZE = 100
 
