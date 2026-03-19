@@ -95,7 +95,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check actor permission
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.resume_from_run_id == ''
         run: |
           if [ "${{ github.actor }}" != "${{ github.repository_owner }}" ]; then
             echo "❌ Unauthorized: only the repo owner can trigger this workflow manually."
