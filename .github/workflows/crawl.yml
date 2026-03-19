@@ -74,6 +74,7 @@ permissions:
   contents: write
   pages: write
   id-token: write
+  actions: write # required for auto-dispatch of next chain run
 
 concurrency:
   group: crawl-adhoc-${{ github.ref }}
