@@ -167,7 +167,7 @@ jobs:
           POLITE_DELAY:        '0.3'
           RESPECT_ROBOTS:      'true'
           OUTPUT_DIR:          './reports'
-          CRAWL_TIMEOUT_SECS:  '300'
+          CRAWL_TIMEOUT_SECS:  '18000'
           CHECKPOINT_IN:       ${{ github.event.inputs.resume_from_run_id != '' && './checkpoint/checkpoint.json' || '' }}
           CHECKPOINT_OUT:      './reports/checkpoint.json'
           RESUME_RUN_COUNT:    ${{ github.event.inputs.resume_run_count || '1' }}
