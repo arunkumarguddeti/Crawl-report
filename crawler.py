@@ -843,9 +843,16 @@ async def crawl() -> tuple[list[dict], bool]:
         queue.append((start, 0))
 
     rp = load_robots(base_url)
-    crawl_start    = time.time()
-    timeout_secs   = CONFIG["CRAWL_TIMEOUT_SECS"]
+    crawl_start      = time.time()
+    timeout_secs     = CONFIG["CRAWL_TIMEOUT_SECS"]
     checkpoint_saved = False
+
+    # ── Block / rate-limit detection counters ─────────────────────────────────
+    # Track consecutive batches where ALL pages timeout or return 403/503.
+    # If this happens 3 batches in a row, the site is likely blocking the runner IP.
+    _consec_blocked_batches = 0
+    _BLOCK_THRESHOLD        = 3   # batches before warning
+    _block_warned           = False
 
     connector = aiohttp.TCPConnector(
         limit=CONFIG["CONCURRENCY"] + 5,
@@ -1011,6 +1018,33 @@ async def crawl() -> tuple[list[dict], bool]:
             # Mark all pages in this batch as fully completed
             for page_url, _ in batch:
                 completed_pages.add(page_url)
+
+            # ── Block / IP-ban detection ──────────────────────────────────
+            # Check if every page in this batch failed with timeout/403/503.
+            # Three consecutive all-fail batches = likely IP block by WAF/CDN.
+            batch_urls = {u for u, _ in batch}
+            batch_page_results = [
+                r for r in results
+                if r.get("page_url") in batch_urls
+                and r.get("link_text") == "(page itself)"
+            ]
+            _bad = {"Timeout", "Connection Error", "SSL Error", "403", "503"}
+            if batch_page_results and all(
+                str(r.get("status", "")) in _bad for r in batch_page_results
+            ):
+                _consec_blocked_batches += 1
+                if _consec_blocked_batches >= _BLOCK_THRESHOLD and not _block_warned:
+                    log.warning(
+                        "🚫 POSSIBLE IP BLOCK — %d consecutive batches returned only "
+                        "Timeout/403/503. The site may be blocking GitHub Actions IP "
+                        "ranges. Suggestions: (1) wait 30-60 min before retrying, "
+                        "(2) lower CONCURRENCY to 1-3, "
+                        "(3) increase POLITE_DELAY to 2.0+, "
+                        "(4) run locally from your Mac instead.",
+                        _consec_blocked_batches)
+                    _block_warned = True
+            else:
+                _consec_blocked_batches = 0  # reset on any successful batch
 
             # ── Adaptive polite delay ─────────────────────────────────────
             _delay = max(CONFIG["POLITE_DELAY"], _rl_wait)
