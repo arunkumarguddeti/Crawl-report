@@ -11,9 +11,11 @@ Usage:
 import asyncio
 import aiohttp
 import csv
-import signal
 import json
 import os
+import re
+import signal
+import socket
 import sys
 import time
 import logging
@@ -49,15 +51,13 @@ CONFIG = {
     "RESPECT_ROBOTS":  os.getenv("RESPECT_ROBOTS", "true").lower() == "true",
     "OUTPUT_DIR":      os.getenv("OUTPUT_DIR",  "./reports"),
     "USER_AGENT":      "Mozilla/5.0 (compatible; SiteCrawler/1.0; +https://github.com/your-repo)",
-    # Query params to strip when normalising URLs (avoid infinite pagination traps).
-    # Drupal additions: search_api_* and f[] are faceted-search params that
-    # generate tens-of-thousands of near-duplicate URLs — stripping them
-    # collapses all variants to one canonical URL so the queue never explodes.
+    # Query params to strip when normalising URLs (avoid infinite pagination traps)
+    # CRITICAL: do NOT add "page" — that strips paginated listing URLs like
+    # /news?page=2, collapsing them to /news (already visited → dropped).
+    # That single mistake caused crawls to stop at 116 pages instead of 3000+.
     "STRIP_PARAMS":    {"utm_source","utm_medium","utm_campaign","utm_content",
                         "utm_term","sessionid","PHPSESSID","sid","ref",
-                        "search_api_fulltext","search_api_page","search_api_sort",
-                        "f","page","sort_by","sort_order","items_per_page",
-                        "delta","langcode"},
+                        "search_api_fulltext","search_api_sort"},
     # File extensions to skip parsing (still HEAD-check, just don't crawl for more links)
     "SKIP_PARSE_EXTS": {".pdf",".zip",".docx",".xlsx",".pptx",".exe",".dmg",
                         ".mp4",".mp3",".avi",".mov",".jpg",".jpeg",".png",
@@ -66,45 +66,49 @@ CONFIG = {
     "SKIP_SCHEMES":    {"mailto","tel","javascript","data","ftp","sms","callto"},
 
     # ── Queue explosion guard ──────────────────────────────────────────────
-    # Drupal Search API / Media Library pages generate 100 000+ near-duplicate
-    # URLs. Lowered cap to 20 000 — plenty for large sites, prevents runaway.
+    # 20 000 is plenty for large sites; prevents Drupal facet/search runaway.
     "MAX_QUEUE":   int(os.getenv("MAX_QUEUE", "20000")),
 
     # URL path fragments that signal crawl-trap pages.
-    # URLs containing any of these strings will NOT be added to the crawl
-    # queue (their HTTP status is still HEAD-checked once as a link).
-    # Override via env var TRAP_PATTERNS as comma-separated strings.
+    # HEAD-checked as links (broken ones appear in report) but NOT crawled.
     #
-    # NOTE: /node/ is intentionally NOT in this list — on Drupal sites,
-    # /node/123 is often the *primary* URL for real content pages.
-    # /jsonapi/ and /views/ajax are data endpoints, not pages.
-    # /media-library generates infinite facet URL permutations (see screenshots).
-    # /search? and search_api_ catch residual Search API URLs after param stripping.
+    # REMOVED (were blocking real gov/Drupal content):
+    #   /page/     Drupal path pagination: /news/page/2 is real content
+    #   /archive/  gov sites have real /archive/year/ sections
+    #   /author/   staff pages are real content
+    #   /tag/ /tags/ /category/ /categories/  Drupal taxonomy listing pages
+    #
+    # ADDED Drupal machine-generated endpoints (not real pages):
+    #   /media-library  thousands of facet URL permutations
+    #   /search?        query-based search result pages
+    #   search_api_page Drupal Search API pager params
+    #   /views/ajax     Drupal Views AJAX JSON (not HTML)
+    #   /jsonapi/       Drupal JSON:API data endpoint
     "TRAP_PATTERNS": set(
         os.getenv("TRAP_PATTERNS",
-            "/page/,/tag/,/tags/,/category/,/categories/,"
-            "/author/,/feed/,/rss/,/wp-json/,/wp-admin/,"
-            "/search/,/?s=,/?p=,/paged=,/archive/,/archives/,"
-            "/?query=,/?q=,/page=,"
-            "/media-library,/search?,search_api_,"
+            "/feed/,/rss/,/wp-json/,/wp-admin/,"
+            "/?s=,/?p=,/paged=,/?query=,/?q=,"
+            "/media-library,/search?,search_api_page,"
             "/views/ajax,/jsonapi/"
         ).split(",")
     ),
 
     # ── Document extensions: HEAD-check only, never crawl ─────────────────
-    # Every URL with one of these extensions (or path containing /files/) is
-    # verified via HEAD to confirm the file exists, but NEVER crawled for links.
     "DOC_EXTS": {".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",
                 ".odt",".ods",".odp",".zip",".tar",".gz",".7z",".rar",
                 ".exe",".dmg",".pkg",".deb",".rpm"},
 
-    # ── Rate-limit / politeness ───────────────────────────────────────────
-    # When the server returns 429 (Too Many Requests), the crawler pauses
-    # this many seconds before retrying.  Doubles on each consecutive 429
-    # up to RATE_LIMIT_MAX_WAIT.  Resets to RATE_LIMIT_BASE_WAIT after any
-    # successful response.
+    # ── Rate-limit backoff ────────────────────────────────────────────────
     "RATE_LIMIT_BASE_WAIT": float(os.getenv("RATE_LIMIT_BASE_WAIT", "5.0")),
     "RATE_LIMIT_MAX_WAIT":  float(os.getenv("RATE_LIMIT_MAX_WAIT",  "120.0")),
+
+    # ── Sitemap seeding ───────────────────────────────────────────────────
+    "SEED_SITEMAP": os.getenv("SEED_SITEMAP", "true").lower() == "true",
+
+    # ── Pagination depth guard ────────────────────────────────────────────
+    # Set > 0 to block /news/page/N and ?page=N beyond this limit.
+    # Default 0 = follow all pagination (safe when SEED_SITEMAP is on).
+    "MAX_PAGINATION_PAGE": int(os.getenv("MAX_PAGINATION_PAGE", "0")),
 
     # ── Targeted page scan ────────────────────────────────────────────────
     # Comma-separated list of specific page URLs to scan.
@@ -189,12 +193,18 @@ def normalize(url: str, base: str = "") -> str | None:
     return clean
 
 
+def _bare_domain(netloc: str) -> str:
+    """Strip www. so www.site.gov and site.gov are treated as the same site."""
+    return netloc.lower().removeprefix("www.")
+
+
 def is_same_domain(url: str, base: str) -> bool:
-    return urlparse(url).netloc.lower() == urlparse(base).netloc.lower()
+    """True if url is on the same domain as base (www/non-www treated equally)."""
+    return _bare_domain(urlparse(url).netloc) == _bare_domain(urlparse(base).netloc)
 
 
 def should_skip_parse(url: str) -> bool:
-    """True if the URL points to a binary/document file we should not parse for links."""
+    """True if URL points to a binary/document file — should not parse for links."""
     path = urlparse(url).path.lower()
     all_skip = CONFIG["SKIP_PARSE_EXTS"] | CONFIG.get("DOC_EXTS", set())
     return any(path.endswith(ext) for ext in all_skip)
@@ -202,8 +212,8 @@ def should_skip_parse(url: str) -> bool:
 
 def is_doc_url(url: str) -> bool:
     """
-    True for document/binary URLs that must be HEAD-checked (to verify the
-    file exists as a link) but NEVER added to the crawl queue.
+    True for document/file URLs: HEAD-check to detect 404 broken file links
+    but NEVER add to the BFS crawl queue.
     Covers Drupal /files/ paths and DOC_EXTS extensions.
     """
     path = urlparse(url).path.lower()
@@ -267,65 +277,65 @@ def status_category(status) -> str:
 #  ASYNC HTTP HELPERS
 # ──────────────────────────────────────────────
 
-# Shared mutable rate-limit state — increased by any worker that sees 429,
-# read by the crawl loop to insert extra inter-batch sleep.
-_rate_limit_wait: float = 0.0   # current extra wait seconds (0 = not rate-limited)
-_consecutive_429: int   = 0     # how many 429s in a row (drives exponential backoff)
+# ── Rate-limit shared state ───────────────────────────────────────────────
+_rl_wait: float = 0.0   # extra inter-batch sleep (0 = not rate-limited)
+_rl_hits: int   = 0     # consecutive 429 count
 
 
-async def _handle_429(url: str) -> None:
-    """Exponential backoff when the server returns 429 Too Many Requests."""
-    global _rate_limit_wait, _consecutive_429
-    _consecutive_429 += 1
-    base  = CONFIG.get("RATE_LIMIT_BASE_WAIT", 5.0)
-    limit = CONFIG.get("RATE_LIMIT_MAX_WAIT",  120.0)
-    wait  = min(base * (2 ** (_consecutive_429 - 1)), limit)
-    _rate_limit_wait = wait
+async def _handle_429(url: str, retry_after: str = "") -> None:
+    """Exponential back-off when server returns 429 Too Many Requests."""
+    global _rl_wait, _rl_hits
+    _rl_hits += 1
+    if retry_after:
+        try:
+            wait = float(retry_after)
+        except ValueError:
+            wait = CONFIG.get("RATE_LIMIT_BASE_WAIT", 5.0)
+    else:
+        base  = CONFIG.get("RATE_LIMIT_BASE_WAIT", 5.0)
+        limit = CONFIG.get("RATE_LIMIT_MAX_WAIT", 120.0)
+        wait  = min(base * (2 ** (_rl_hits - 1)), limit)
+    _rl_wait = wait
     log.warning(
-        "🚦 429 Too Many Requests for %s — rate-limited. "
-        "Backing off %.0fs (attempt %d). "
-        "Stop all other terminal crawls if running multiple instances!",
-        url[:80], wait, _consecutive_429)
+        "\U0001f6a6 429 on %s — backing off %.0fs (hit #%d). "
+        "Stop any other parallel crawl instances!",
+        url[:70], wait, _rl_hits)
     await asyncio.sleep(wait)
 
 
-def _reset_rate_limit() -> None:
-    """Call after any successful (non-429) response to reset backoff."""
-    global _rate_limit_wait, _consecutive_429
-    if _consecutive_429 > 0:
-        log.info("✅ Rate limit lifted — resuming normal crawl speed.")
-    _rate_limit_wait  = 0.0
-    _consecutive_429  = 0
+def _reset_rl() -> None:
+    """Reset rate-limit state after a successful response."""
+    global _rl_wait, _rl_hits
+    if _rl_hits > 0:
+        log.info("\u2705 Rate limit cleared — resuming normal speed.")
+    _rl_wait = 0.0
+    _rl_hits = 0
 
 
 async def fetch_page_html(session: aiohttp.ClientSession, url: str) -> tuple[int, str, str]:
     """
     GET a page. Returns (status_code, html_text, final_url_after_redirects).
-    Handles 429 Rate Limit with exponential backoff (up to RATE_LIMIT_MAX_WAIT).
-    Retries up to 2 times on Timeout.
+    Handles 429 with exponential back-off. Retries up to 3× on timeout.
     """
     headers = {"User-Agent": CONFIG["USER_AGENT"]}
     timeout = aiohttp.ClientTimeout(total=CONFIG["TIMEOUT"])
-    max_attempts = 3
 
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, 4):
         try:
             async with session.get(url, headers=headers, timeout=timeout,
                                    allow_redirects=True, ssl=False) as resp:
                 if resp.status == 429:
-                    await _handle_429(url)
-                    continue  # retry after backoff
-                _reset_rate_limit()
+                    await _handle_429(url, resp.headers.get("Retry-After", ""))
+                    continue
+                _reset_rl()
                 try:
                     html = await resp.text(errors="ignore")
                 except Exception:
                     html = ""
                 return resp.status, html, str(resp.url)
         except asyncio.TimeoutError:
-            if attempt < max_attempts:
-                log.debug("Timeout on attempt %d/%d for %s — retrying",
-                          attempt, max_attempts, url[:80])
-                await asyncio.sleep(1 * attempt)
+            if attempt < 3:
+                await asyncio.sleep(attempt * 2)
                 continue
             return "Timeout", "", url
         except aiohttp.ClientSSLError:
@@ -356,13 +366,15 @@ async def check_link_status(session: aiohttp.ClientSession,
                                     allow_redirects=True, ssl=False) as resp:
                 load_ms = round((time.monotonic() - t0) * 1000)
                 if resp.status == 429:
-                    await _handle_429(url)
+                    await _handle_429(url, resp.headers.get("Retry-After", ""))
                     t0 = time.monotonic()
                     continue
-                if resp.status == 405:
+                # 405 = HEAD not allowed; 403 = WAF blocks HEAD but GET works.
+                # Both trigger a GET fallback for the real status code.
+                if resp.status in (405, 403):
                     raise aiohttp.ClientResponseError(
-                        resp.request_info, resp.history, status=405)
-                _reset_rate_limit()
+                        resp.request_info, resp.history, status=resp.status)
+                _reset_rl()
                 result = (resp.status, str(resp.url), load_ms)
                 break
         except aiohttp.ClientResponseError:
@@ -372,10 +384,10 @@ async def check_link_status(session: aiohttp.ClientSession,
                                        allow_redirects=True, ssl=False) as resp:
                     load_ms = round((time.monotonic() - t0) * 1000)
                     if resp.status == 429:
-                        await _handle_429(url)
+                        await _handle_429(url, resp.headers.get("Retry-After", ""))
                         t0 = time.monotonic()
                         continue
-                    _reset_rate_limit()
+                    _reset_rl()
                     result = (resp.status, str(resp.url), load_ms)
                     break
             except asyncio.TimeoutError:
@@ -391,7 +403,7 @@ async def check_link_status(session: aiohttp.ClientSession,
         except Exception as e:
             result = (f"Error: {type(e).__name__}", url, -1); break
     else:
-        result = ("Timeout", url, -1)  # all 3 attempts were 429 retries
+        result = ("Timeout", url, -1)
 
     link_cache[url] = result
     return result
@@ -557,34 +569,42 @@ async def targeted_crawl(target_urls: list[str]) -> list[dict]:
 
 def is_trap_url(url: str) -> bool:
     """
-    Returns True if the URL matches a known crawl-trap pattern
-    (pagination, tag archives, feeds, admin panels, etc.).
-    These pages are HEAD-checked for broken-link purposes but are
-    NOT crawled for further links — stopping queue explosion.
+    True if the URL matches a known crawl-trap pattern.
+    These are HEAD-checked as links (so broken ones appear in the report)
+    but are NOT added to the BFS crawl queue.
     """
     lower = url.lower()
-    return any(pat.strip() and pat.strip() in lower
-               for pat in CONFIG["TRAP_PATTERNS"])
+    if any(pat.strip() and pat.strip() in lower for pat in CONFIG["TRAP_PATTERNS"]):
+        return True
+    # Pagination depth guard: only active when MAX_PAGINATION_PAGE > 0.
+    # Prevents following infinite archive pages (page 500, page 501 …)
+    # while still allowing /news/page/2, /events/page/3 by default.
+    max_pag = CONFIG.get("MAX_PAGINATION_PAGE", 0)
+    if max_pag > 0:
+        m = re.search(r"/page/(\d+)", lower)
+        if m and int(m.group(1)) > max_pag:
+            return True
+        m2 = re.search(r"[?&]page=(\d+)", lower)
+        if m2 and int(m2.group(1)) > max_pag:
+            return True
+    return False
 
 
 def safe_enqueue(queue: deque, seen: set, url: str, depth: int) -> bool:
     """
-    Add a URL to the crawl queue only when ALL conditions are met:
-      1. Not already seen (visited or previously queued)
-      2. Depth is within MAX_DEPTH limit
-      3. Queue is below MAX_QUEUE hard cap
+    Add a URL to the BFS crawl queue only when ALL conditions are met:
+      1. Not already seen (visited or queued)
+      2. Depth within MAX_DEPTH (rejected without adding to seen, so shallower
+         re-discovery at a later crawl step still works)
+      3. Queue below MAX_QUEUE cap
       4. Not a trap URL pattern
-      5. Not a binary/skip-parse extension
-
-    IMPORTANT: URLs beyond MAX_DEPTH are rejected WITHOUT being added to `seen`.
-    This prevents depth-locking: if Page X is first discovered at depth 9 (over
-    limit) it stays out of `seen`, so when found again at depth 2 it can be
-    queued and crawled normally.
+      5. Not a binary file extension
+      6. Not a document / /files/ path (those are HEAD-checked as links only)
     """
     if url in seen:
         return False
     if depth > CONFIG["MAX_DEPTH"]:
-        return False          # do NOT add to seen — allow shallower re-discovery
+        return False          # NOT added to seen — allow shallower re-discovery
     if len(queue) >= CONFIG["MAX_QUEUE"]:
         log.warning("MAX_QUEUE cap (%d) reached — URL dropped: %s",
                     CONFIG["MAX_QUEUE"], url[:80])
@@ -593,7 +613,8 @@ def safe_enqueue(queue: deque, seen: set, url: str, depth: int) -> bool:
         return False
     if should_skip_parse(url):
         return False
-    # /files/ paths and document extensions: HEAD-check as links, never crawl.
+    # /files/ paths and document extensions: verify as links (HEAD-check)
+    # but never BFS-crawl them for more links.
     if is_doc_url(url):
         return False
     seen.add(url)
@@ -601,33 +622,165 @@ def safe_enqueue(queue: deque, seen: set, url: str, depth: int) -> bool:
     return True
 
 
+
+# ──────────────────────────────────────────────
+#  DNS / IP RESOLUTION
+# ──────────────────────────────────────────────
+
+_dns_cache: dict[str, str] = {}   # hostname → resolved IP
+
+
+def _resolve_sync(hostname: str) -> str:
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+        ipv4 = [i[4][0] for i in infos if i[0] == socket.AF_INET]
+        ipv6 = [i[4][0] for i in infos if i[0] == socket.AF_INET6]
+        return ipv4[0] if ipv4 else (ipv6[0] if ipv6 else "N/A")
+    except Exception:
+        return "N/A"
+
+
+async def resolve_ip(hostname: str) -> str:
+    """Resolve hostname → IP, cached per hostname."""
+    if hostname in _dns_cache:
+        return _dns_cache[hostname]
+    loop = asyncio.get_event_loop()
+    ip = await loop.run_in_executor(None, _resolve_sync, hostname)
+    _dns_cache[hostname] = ip
+    return ip
+
+
+async def enrich_with_ips(results: list[dict]) -> None:
+    """
+    Resolve IPs for two things per result row:
+      - page_ip : IP of the parent page (the page being crawled)
+      - link_ip : IP of the link URL (could be external)
+    Both are added as fields and appear in the HTML report.
+    One DNS lookup per unique hostname, cached and resolved concurrently.
+    """
+    from urllib.parse import urlparse as _up
+    hostnames = set()
+    for r in results:
+        h1 = _up(r.get("page_url", "")).hostname or ""
+        h2 = _up(r.get("link_url", "")).hostname or ""
+        if h1: hostnames.add(h1)
+        if h2: hostnames.add(h2)
+    hostnames.discard("")
+    log.info("\U0001f50d Resolving IPs for %d unique hostnames…", len(hostnames))
+    await asyncio.gather(*[resolve_ip(h) for h in hostnames])
+    resolved = sum(1 for h in hostnames if _dns_cache.get(h, "N/A") != "N/A")
+    log.info("\U0001f50d IP resolution: %d/%d resolved", resolved, len(hostnames))
+    for r in results:
+        ph = _up(r.get("page_url", "")).hostname or ""
+        lh = _up(r.get("link_url", "")).hostname or ""
+        r["page_ip"] = _dns_cache.get(ph, "N/A")
+        r["link_ip"] = _dns_cache.get(lh, "N/A")
+
+
+# ──────────────────────────────────────────────
+#  SITEMAP SEEDER
+# ──────────────────────────────────────────────
+
+async def _seed_from_sitemap(base_url: str, queue: "deque",
+                              seen: set, session: "aiohttp.ClientSession") -> int:
+    """
+    Discover and parse XML sitemaps, seeding all internal URLs into the queue.
+    Tries robots.txt first for Sitemap: directives, then common sitemap paths.
+    Handles nested sitemap indexes. Sitemap URLs bypass trap filters because
+    they are explicitly declared by the site as canonical content pages.
+    """
+    added    = 0
+    sm_queue: list[str] = []
+    visited  : set[str] = set()
+    headers  = {"User-Agent": CONFIG["USER_AGENT"]}
+    timeout  = aiohttp.ClientTimeout(total=20)
+    base     = base_url.rstrip("/")
+
+    # Step 1: robots.txt for Sitemap: directives
+    try:
+        async with session.get(f"{base}/robots.txt", headers=headers,
+                               timeout=timeout, ssl=False) as resp:
+            if resp.status == 200:
+                for line in (await resp.text(errors="ignore")).splitlines():
+                    if line.strip().lower().startswith("sitemap:"):
+                        sm_url = line.split(":", 1)[1].strip()
+                        if sm_url and sm_url not in visited:
+                            sm_queue.append(sm_url)
+                            log.info("\U0001f5fa  Sitemap from robots.txt: %s", sm_url)
+    except Exception as e:
+        log.debug("robots.txt sitemap check failed: %s", e)
+
+    # Step 2: common paths if robots.txt had none
+    if not sm_queue:
+        for path in ["/sitemap.xml", "/sitemap_index.xml", "/sitemap/",
+                     "/sitemaps/1", "/sitemap-index.xml"]:
+            sm_queue.append(base + path)
+
+    # Step 3: fetch and parse
+    while sm_queue:
+        sm_url = sm_queue.pop(0)
+        if sm_url in visited:
+            continue
+        visited.add(sm_url)
+        try:
+            async with session.get(sm_url, headers=headers,
+                                   timeout=timeout, ssl=False) as resp:
+                if resp.status != 200:
+                    continue
+                ct = resp.headers.get("Content-Type", "")
+                if "html" in ct.lower():
+                    continue  # got an HTML error page, not XML
+                text = await resp.text(errors="ignore")
+        except Exception as e:
+            log.debug("Sitemap fetch failed %s: %s", sm_url, e)
+            continue
+
+        # Child sitemaps
+        for loc in re.findall(r"<sitemap>\s*<loc>\s*(.*?)\s*</loc>", text, re.DOTALL):
+            if loc not in visited:
+                sm_queue.append(loc.strip())
+
+        # Page URLs — add directly, bypassing trap filters
+        for loc in re.findall(r"<url>\s*<loc>\s*(.*?)\s*</loc>", text, re.DOTALL):
+            loc  = loc.strip()
+            norm = normalize(loc)
+            if not norm or not is_same_domain(norm, base_url):
+                continue
+            if norm in seen or is_doc_url(norm):
+                continue
+            seen.add(norm)
+            queue.append((norm, 0))
+            added += 1
+
+    if added:
+        log.info("\U0001f5fa  Sitemap seeding: %d URLs added to queue", added)
+    else:
+        log.warning("\U0001f5fa  No sitemap found — relying on link discovery only")
+    return added
+
+
 async def crawl() -> tuple[list[dict], bool]:
     """
     Returns (results, checkpoint_saved).
-    checkpoint_saved=True means the crawl was paused and state saved to
-    CHECKPOINT_OUT.  Ctrl-C / SIGTERM triggers graceful shutdown: the current
-    batch finishes, then full reports (CSV / Excel / HTML) are written from
-    whatever was collected — so you always get a usable report on early exit.
+    Ctrl-C / SIGTERM triggers graceful shutdown: the current batch finishes,
+    then full reports are written from whatever was collected so far.
     """
     base_url = CONFIG["BASE_URL"].rstrip("/")
     sem      = asyncio.Semaphore(CONFIG["CONCURRENCY"])
 
-    # ── Graceful shutdown (Ctrl-C or SIGTERM) ─────────────────────────────
+    # ── Graceful shutdown (Ctrl-C / SIGTERM) ──────────────────────────────
     _shutdown = asyncio.Event()
 
-    def _request_shutdown(sig_name: str):
+    def _on_signal(sig_name: str):
         if not _shutdown.is_set():
-            log.warning(
-                "⚠️  %s received — finishing current batch then writing "
-                "partial report with %d results collected so far…",
-                sig_name, len(results) if "results" in dir() else 0)
+            log.warning("⚠️  %s — finishing batch then writing partial report…",
+                        sig_name)
             _shutdown.set()
 
     _loop = asyncio.get_event_loop()
-    for _sig in (signal.SIGINT, signal.SIGTERM):
+    for _s in (signal.SIGINT, signal.SIGTERM):
         try:
-            _loop.add_signal_handler(_sig,
-                lambda s=_sig.name: _request_shutdown(s))
+            _loop.add_signal_handler(_s, lambda n=_s.name: _on_signal(n))
         except (NotImplementedError, ValueError):
             pass  # Windows
 
@@ -692,12 +845,15 @@ async def crawl() -> tuple[list[dict], bool]:
 
     async with aiohttp.ClientSession(connector=connector) as session:
 
+        # ── Sitemap seeding on fresh crawl ────────────────────────────────
+        if CONFIG.get("SEED_SITEMAP") and not CONFIG.get("CHECKPOINT_IN", ""):
+            await _seed_from_sitemap(base_url, queue, seen, session)
+
         while queue:
             # ── Graceful shutdown: Ctrl-C / SIGTERM ───────────────────────
             if _shutdown.is_set():
-                log.warning(
-                    "Shutdown requested — stopping after current batch. "
-                    "Writing partial report (%d results).", len(results))
+                log.warning("Shutdown requested — writing partial report "
+                            "(%d results collected).", len(results))
                 break
 
             # ── Hard stop: MAX_PAGES reached ──────────────────────────────
@@ -818,10 +974,15 @@ async def crawl() -> tuple[list[dict], bool]:
                     # ── Decide whether to crawl this link ─────────────────
                     if link_type != "Internal":
                         return  # never crawl external domains
-                    if str(lnk_status) not in ("200", "301", "302"):
-                        return  # don't queue broken/errored pages
                     if CONFIG["MAX_PAGES"] > 0 and len(visited_pages) >= CONFIG["MAX_PAGES"]:
-                        return  # hard page cap — stop queueing
+                        return  # hard page cap
+                    # Only skip crawling if DEFINITIVELY broken.
+                    # 404/410/451 = does not exist → skip.
+                    # Timeout/Error/5xx on HEAD are transient — still enqueue;
+                    # the actual GET when we crawl the page reveals true status.
+                    s = str(lnk_status)
+                    if s in ("404", "410", "451"):
+                        return
 
                     # Trap-pattern check with counter for reporting
                     if is_trap_url(link_url):
@@ -840,15 +1001,13 @@ async def crawl() -> tuple[list[dict], bool]:
             for page_url, _ in batch:
                 completed_pages.add(page_url)
 
-            # ── Polite delay + adaptive rate-limit backoff ────────────────
-            base_delay = CONFIG["POLITE_DELAY"]
-            extra      = _rate_limit_wait  # set by _handle_429, reset on success
-            total_delay = max(base_delay, extra)
-            if total_delay > 0:
-                if extra > base_delay:
-                    log.info("⏳ Rate-limit cooldown: sleeping %.1fs between batches",
-                             total_delay)
-                await asyncio.sleep(total_delay)
+            # ── Adaptive polite delay ─────────────────────────────────────
+            _delay = max(CONFIG["POLITE_DELAY"], _rl_wait)
+            if _delay > 0:
+                if _rl_wait > CONFIG["POLITE_DELAY"]:
+                    log.info("⏳ Rate-limit cooldown: %.1fs between batches",
+                             _delay)
+                await asyncio.sleep(_delay)
 
     log.info(
         "Crawl complete. visited=%d  completed=%d  results=%d  "
@@ -863,7 +1022,8 @@ async def crawl() -> tuple[list[dict], bool]:
 # ──────────────────────────────────────────────
 
 FIELDS = ["page_url","link_url","link_text","link_type",
-          "status","final_url","load_ms","depth","effort","category","timestamp"]
+          "status","final_url","load_ms","depth","effort","category",
+          "page_ip","link_ip","timestamp"]
 
 def write_csv(results: list[dict], path: str):
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -975,13 +1135,13 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
             return f"{ms} ms"
         return f"{ms/1000:.1f}s"
 
-    # Only embed non-200 rows in HTML to keep file size under GitHub's 100MB limit.
-    # 200 OK rows are still exported in full to CSV and Excel.
+    # Embed ALL rows in HTML including 200 OK links.
+    # 200 OK external links are important: they are valid today but could break
+    # if the external site changes its URL structure without setting up redirects.
+    # Users can filter them in/out via the "Show 200 OK" toggle in the report.
     js_rows = []
     for r in results:
         s = str(r.get("status",""))
-        if s == "200":
-            continue  # skip OK rows from HTML — available in CSV/Excel
         lm = r.get("load_ms", -1)
         js_rows.append({
             "pu": r["page_url"],
@@ -994,6 +1154,8 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
             "dp": r.get("depth",""),
             "ef": r.get("effort",""),
             "ca": r.get("category",""),
+            "pi": r.get("page_ip","N/A"),
+            "li": r.get("link_ip","N/A"),
             "rc": row_class(r["status"]),
             "ts": str(r.get("timestamp",""))[:22],
         })
@@ -1149,9 +1311,12 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
     <div class="card c-white"  onclick="typeFilter2('external')" id="card-ext">     <div class="val">{external:,}</div> <div class="lbl">External Links</div></div>
   </div>
 
-  <div style="background:#1e3a2f;border:1px solid #16a34a;border-radius:8px;padding:10px 16px;margin-bottom:16px;font-size:13px;color:#86efac;">
-    ✅ <b>200 OK links are excluded from this view</b> to keep the report fast and focused.
-    The full dataset including all OK links is available in the <b>Excel</b> and <b>CSV</b> exports above.
+  <div style="background:#1e2a3f;border:1px solid #3b82f6;border-radius:8px;padding:10px 16px;margin-bottom:16px;font-size:13px;color:#93c5fd;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+    <span>ℹ️  <b>200 OK links are included</b> — useful for tracking external URLs that work today but may break if the destination site changes paths without redirects.</span>
+    <label style="display:flex;align-items:center;gap:6px;margin-left:auto;cursor:pointer;color:#e2e8f0;white-space:nowrap">
+      <input type="checkbox" id="hide200" onchange="applyFilters()" style="width:14px;height:14px">
+      Hide 200 OK rows
+    </label>
   </div>
 
   <div class="charts">
@@ -1178,6 +1343,8 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
         <option value="Internal">Internal</option>
         <option value="External">External</option>
       </select></div>
+    <div><label>Domain</label>
+      <input type="text" id="domainFilter" placeholder="e.g. x.com" oninput="applyFilters()" style="width:160px"></div>
     <div><label>Effort</label>
       <select id="effortFilter" onchange="applyFilters()">
         <option value="">All Efforts</option>
@@ -1210,7 +1377,9 @@ def build_html_report(results: list[dict], csv_path: str, elapsed: float,
           <th onclick="sortBy(6)">Depth</th>
           <th onclick="sortBy(7)">Effort</th>
           <th onclick="sortBy(8)">Load Time</th>
-          <th onclick="sortBy(9)">Timestamp</th>
+          <th onclick="sortBy(9)" title="IP of the parent page being crawled">Parent IP</th>
+          <th onclick="sortBy(10)" title="IP of the link URL">Link IP</th>
+          <th onclick="sortBy(11)">Timestamp</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
@@ -1231,7 +1400,7 @@ try {{
   console.error("Failed to decode report data:", e);
   document.addEventListener("DOMContentLoaded", () => {{
     const tb = document.getElementById("tbody");
-    if(tb) tb.innerHTML = '<tr><td colspan="10" style="color:#f87171;padding:20px;text-align:center">⚠️ Report data failed to decode. Download the CSV or Excel file for full results.</td></tr>';
+    if(tb) tb.innerHTML = '<tr><td colspan="12" style="color:#f87171;padding:20px;text-align:center">⚠️ Report data failed to decode. Download the CSV or Excel file for full results.</td></tr>';
   }});
 }}
 const PAGE_SIZE = {PAGE_SIZE};
@@ -1298,6 +1467,8 @@ function renderPage(page){{
       <td>${{esc(r.dp)}}</td>
       <td>${{effortBadge(r.ef)}}</td>
       ${{loadCell(r.lm)}}
+      <td style="font-family:monospace;font-size:11px;color:#7dd3fc;white-space:nowrap">${{esc(r.pi||'N/A')}}</td>
+      <td style="font-family:monospace;font-size:11px;color:#93c5fd;white-space:nowrap">${{esc(r.li||'N/A')}}</td>
       <td>${{esc(r.ts)}}</td>
     </tr>`).join('');
   renderPager();
@@ -1339,11 +1510,15 @@ function _applyFilters(){{
   const st=document.getElementById('statusFilter').value;
   const tp=document.getElementById('typeFilter').value;
   const ef=document.getElementById('effortFilter').value;
+  const hide200=document.getElementById('hide200')?.checked;
+  const dom=(document.getElementById('domainFilter')?.value||'').toLowerCase().trim();
   filtered=ALL_DATA.filter(r=>{{
+    if(hide200&&r.rc==='ok')return false;
     if(st&&r.rc!==st)return false;
     if(tp&&r.tp!==tp)return false;
     if(ef&&r.ef!==ef)return false;
-    if(q&&!(r.pu.toLowerCase().includes(q)||r.lu.toLowerCase().includes(q)||r.lt.toLowerCase().includes(q)))return false;
+    if(dom&&!r.lu.toLowerCase().includes(dom))return false;
+    if(q&&!(r.pu.toLowerCase().includes(q)||r.lu.toLowerCase().includes(q)||r.lt.toLowerCase().includes(q)||(r.pi||'').includes(q)||(r.li||'').includes(q)))return false;
     return true;
   }});
   if(sortCol>=0)sortFiltered();
@@ -1355,6 +1530,8 @@ function resetFilters(){{
   document.getElementById('statusFilter').value='';
   document.getElementById('typeFilter').value='';
   document.getElementById('effortFilter').value='';
+  const h200=document.getElementById('hide200');if(h200)h200.checked=false;
+  const hdom=document.getElementById('domainFilter');if(hdom)hdom.value='';
   filtered=ALL_DATA.slice();sortCol=-1;sortAsc=true;
   document.querySelectorAll('#thead th').forEach(th=>th.classList.remove('sort-asc','sort-desc'));
   document.querySelectorAll('.card').forEach(c=>c.classList.remove('active'));
@@ -1385,7 +1562,7 @@ function updateCardHighlight(){{
 }}
 
 // ── SORT ─────────────────────────────────────────────────────
-const SORT_KEYS=['pu','lu','lt','tp','st','ca','dp','ef','lm','ts'];
+const SORT_KEYS=['pu','lu','lt','tp','st','ca','dp','ef','lm','pi','li','ts'];
 function sortBy(col){{
   if(sortCol===col){{sortAsc=!sortAsc;}}else{{sortCol=col;sortAsc=true;}}
   document.querySelectorAll('#thead th').forEach((th,i)=>{{
@@ -1549,8 +1726,9 @@ def write_excel(results: list[dict], path: str):
 
     EXCEL_MAX_ROWS = 1_048_576  # Excel hard limit including header row
     headers    = ["Parent URL","Link URL","Anchor Text","Type","Status",
-                  "Category","Depth","Effort","Load Time (ms)","Timestamp"]
-    col_widths = [70, 70, 35, 12, 12, 18, 8, 14, 16, 24]
+                  "Category","Depth","Effort","Load Time (ms)","Timestamp",
+                  "Parent IP","Link IP"]
+    col_widths = [70, 70, 35, 12, 12, 18, 8, 14, 16, 24, 16, 16]
 
     def make_data_sheet(wb, title, rows, is_first=False):
         """Write up to EXCEL_MAX_ROWS-1 data rows to a sheet with headers."""
@@ -1576,7 +1754,8 @@ def write_excel(results: list[dict], path: str):
                 r.get("link_text",""), r.get("link_type",""),
                 str(r.get("status","")), r.get("category",""),
                 r.get("depth",""), r.get("effort",""),
-                load_val, str(r.get("timestamp",""))
+                load_val, str(r.get("timestamp","")),
+                r.get("page_ip","N/A"), r.get("link_ip","N/A"),
             ]
             fill = STATUS_FILLS.get(rc(r.get("status","")))
             for ci, val in enumerate(row_vals, 1):
@@ -1712,10 +1891,14 @@ async def main():
     html_path  = str(output_dir / f"report_{file_tag}.html")
     xlsx_path  = str(output_dir / f"broken_links_{file_tag}.xlsx")
 
+    # Resolve IPs for parent pages and link URLs (one DNS call per unique hostname)
+    await enrich_with_ips(results)
+
     write_csv(results, csv_path)
     # Excel: write non-200 rows only (broken/redirect/error/timeout).
-    # 200 OK rows make files enormous (2M+ rows) and are already in the CSV.
-    # For a 2.8M-row crawl this reduces Excel to ~15K rows — actually usable.
+    # The HTML report now includes 200 OK rows with a hide/show toggle.
+    # Excel is kept as the actionable broken-links list to stay under size limits.
+    # All rows including 200 OK are available in the CSV for full audits.
     excel_rows = [r for r in results if str(r.get("status","")) != "200"]
     log.info("Excel: writing %d non-200 rows (%d OK rows in CSV only)",
              len(excel_rows), len(results) - len(excel_rows))
